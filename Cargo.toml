@@ -233,6 +233,10 @@ members = [
     [workspace.dependencies.pest]
     version = "2.7"
 
+    [workspace.dependencies.lbug]
+    version = "0.19"
+    default-features = false
+
     [workspace.dependencies.rocksdb]
     version = "0.24"
     features = [ "multi-threaded-cf" ]

@@ -11,9 +11,11 @@ use crate::{
 	value::{Slice, Value, Values},
 };
 
+pub mod ladybug;
 pub mod postgres;
 pub mod rocksdb;
 
+pub use ladybug::LadybugDatabaseDriver;
 pub use postgres::PostgresDatabaseDriver;
 pub use rocksdb::RocksDbDatabaseDriver;
 

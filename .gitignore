@@ -117,3 +117,6 @@ container-runner/examples/unity-demo/.vsconfig
 # Python bytecode caches.
 __pycache__/
 *.pyc
+
+# Nested ladybug-skill checkout (managed separately)
+ladybug-skill/

@@ -86,7 +86,8 @@ members = [
   "rivetkit-typescript/packages/rivetkit-napi",
   "rivetkit-typescript/packages/rivetkit-wasm",
   "examples/chat-room-rust",
-  "examples/hello-world-rust"
+  "examples/hello-world-rust",
+  "examples/ladybug-graph",
 ]
 
   [workspace.package]
@@ -236,6 +237,17 @@ members = [
 
     [workspace.dependencies.lbug]
     version = "0.19"
+    default-features = false
+
+    [workspace.dependencies.adbc_core]
+    version = "0.24"
+
+    [workspace.dependencies.arrow-array]
+    version = "59"
+    default-features = false
+
+    [workspace.dependencies.arrow-schema]
+    version = "59"
     default-features = false
 
     [workspace.dependencies.rocksdb]

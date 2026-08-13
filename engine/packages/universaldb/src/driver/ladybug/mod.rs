@@ -29,8 +29,6 @@
 mod database;
 mod transaction;
 
-pub(crate) use database::SharedInternal;
-
 pub use database::{LadybugConfig, LadybugDatabaseDriver};
 pub use transaction::{
 	LadybugNodeSpec, LadybugRelSpec, LadybugRow, LadybugTransaction, LadybugTransactionDriver,

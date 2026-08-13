@@ -197,7 +197,7 @@ impl LadybugTransaction {
 		for op in &ops {
 			if let Err(err) = conn.query(op) {
 				failed = true;
-				first_error = Some(err.context("ladybug write failed"));
+				first_error = Some(anyhow::Error::new(err));
 			}
 		}
 
@@ -259,7 +259,7 @@ fn value_to_cypher_literal(value: &Value) -> String {
 pub struct LadybugTransactionDriver;
 
 /// Collects a `lbug::QueryResult` into owned rows, capturing the projected column names.
-fn collect_rows<'a>(mut result: lbug::QueryResult<'a>) -> Vec<LadybugRow> {
+fn collect_rows<'a>(result: lbug::QueryResult<'a>) -> Vec<LadybugRow> {
 	let columns = result.get_column_names();
 	result
 		.map(|values| LadybugRow::new(columns.clone(), values))
@@ -315,7 +315,7 @@ impl TransactionDriver for LadybugTransactionDriver {
 		&'a self,
 		_opt: RangeOption<'a>,
 		_isolation_level: IsolationLevel,
-	) -> crate::value::Stream<'a, Value> {
+	) -> crate::value::Stream<'a, crate::value::Value> {
 		use futures_util::stream;
 		Box::pin(stream::once(async {
 			Err(anyhow::anyhow!(

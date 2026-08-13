@@ -80,6 +80,7 @@ members = [
   "engine/packages/ups-broadcast",
   "examples/chat-room-rust",
   "examples/hello-world-rust",
+  "examples/ladybug-graph",
   "container-runner"
 ]
 
@@ -235,6 +236,17 @@ members = [
 
     [workspace.dependencies.lbug]
     version = "0.19"
+    default-features = false
+
+    [workspace.dependencies.adbc_core]
+    version = "0.24"
+
+    [workspace.dependencies.arrow-array]
+    version = "59"
+    default-features = false
+
+    [workspace.dependencies.arrow-schema]
+    version = "59"
     default-features = false
 
     [workspace.dependencies.rocksdb]

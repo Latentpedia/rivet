@@ -249,9 +249,14 @@ members = [
     version = "59"
     default-features = false
 
+    # lbug (ladybug) bundles LZ4 and ZSTD into liblbug.a and links it with
+    # +whole-archive, so enabling rocksdb's lz4/zstd features would link two
+    # copies of the same symbols. Keep snappy/zlib/bzip2 (lbug's copies are
+    # C++-namespaced and cannot collide).
     [workspace.dependencies.rocksdb]
     version = "0.24"
-    features = [ "multi-threaded-cf" ]
+    default-features = false
+    features = [ "snappy", "zlib", "bzip2", "bindgen-runtime", "multi-threaded-cf" ]
 
     [workspace.dependencies.hyper-util]
     version = "0.1.10"

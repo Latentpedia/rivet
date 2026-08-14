@@ -2,28 +2,40 @@
 # Ladybug-graph demo: run a distributed message-passing graph algorithm over a shared LadybugDB
 # store, with NUM_SERVERS shard workers exchanging messages only through the ADBC (Arrow) channel.
 #
-# Two modes:
+# Usage (the algorithm can be given directly, or after an explicit mode):
 #
-#   1. "threads" (default) — no engine needed. Spawns NUM_SERVERS concurrent worker threads, each
-#      opening its own ADBC connection to the shared on-disk store, and runs the algorithm to a
-#      fixed point. Persists the result back into the graph.
+#   ./scripts/run-ladybug-demo.sh kcore 2     # k-core with k=2 (default algorithm/k)
+#   ./scripts/run-ladybug-demo.sh wcc
+#   ./scripts/run-ladybug-demo.sh threads wcc # explicit mode + algorithm
 #
-#      ./scripts/run-ladybug-demo.sh kcore 2
-#      ./scripts/run-ladybug-demo.sh wcc
-#
-#   2. "rivet" — the same compute wrapped as Rivet actors (see src/actors.rs, src/bin/server.rs).
-#      Requires the engine binary and a Rivet client to trigger the coordinator; see README.
+#   ./scripts/run-ladybug-demo.sh rivet       # Rivet actor deployment (needs the engine)
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# "threads" (default) and "rivet" are modes; anything else is treated as the algorithm
+# (kcore|k-core|wcc) in the default "threads" mode.
 mode="${1:-threads}"
+case "$mode" in
+  threads|rivet) ;;
+  kcore|k-core|wcc|WCC)
+    algo="$1"
+    shift 1 || true
+    set -- threads "$algo" "$@"
+    mode=threads
+    ;;
+  *)
+    echo "unknown mode or algorithm '$mode' (expected: threads, rivet, kcore, or wcc)" >&2
+    exit 1
+    ;;
+esac
 
 case "$mode" in
   threads)
     algo="${2:-kcore}"
     shift 2 || true
-    cargo run --release -p example-ladybug-graph -- "$algo" "$@"
+    # --bin pins the demo binary (the package also ships the rivet `server` binary).
+    cargo run --release -p example-ladybug-graph --bin example-ladybug-graph -- "$algo" "$@"
     ;;
   rivet)
     echo "building engine + example (one-time)..." >&2
@@ -35,9 +47,5 @@ case "$mode" in
     echo "building done. Host worker+coordinator actors in one Rivet host process (one embedded store) and trigger runAlgorithm:" >&2
     echo "  export RIVET_ENGINE_BINARY_PATH=\$PWD/target/release/rivet-engine" >&2
     echo "  LADYBUG_DB=\$db NUM_SERVERS=3 ./target/release/server" >&2
-    ;;
-  *)
-    echo "unknown mode '$mode' (use 'threads' or 'rivet')" >&2
-    exit 1
     ;;
 esac

@@ -29,9 +29,11 @@ use async_trait::async_trait;
 use rivetkit::{
 	Action, Actor, Ctx, Handles, Registry,
 	action,
+	client::GetOrCreateOptions,
 	typed_client::TypedClientExt,
 };
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 use crate::algorithm::Algorithm;
 
@@ -147,7 +149,9 @@ impl Handles<RunSuperstep> for VertexWorker {
 			let algo = algo(action.algo_idx, action.k)?;
 			let db = shared_db()?;
 			let mut db = db.lock().unwrap();
-			Ok(crate::algorithm::run_superstep(&mut db, server, action.round, algo)?)
+			let produced = crate::algorithm::run_superstep(&mut db, server, action.round, algo)?;
+			info!(server, round = action.round, produced, "vertex worker superstep complete");
+			Ok(produced)
 		})
 	}
 }
@@ -216,6 +220,7 @@ impl Handles<RunAlgorithm> for Coordinator {
 
 			// The control plane: reach every worker actor across the servers via Rivet.
 			let client = ctx.client()?;
+			info!(run_id = action.run_id, num_servers, ?algo, "starting distributed algorithm run");
 			let mut produced = i64::MAX;
 			let mut round = 0i64;
 			let mut rounds = 0i64;
@@ -226,8 +231,17 @@ impl Handles<RunAlgorithm> for Coordinator {
 				}
 				produced = 0;
 				for s in 0..num_servers {
+					// The shard rides the connection params so the worker's `ctx.conn()` knows which
+					// shard it owns (the actor key tags it, but the conn state carries the shard id).
 					let worker = client
-						.get_or_create_typed::<VertexWorker>(WORKER_ACTOR, [s.to_string()], Default::default())
+						.get_or_create_typed::<VertexWorker>(
+							WORKER_ACTOR,
+							[s.to_string()],
+							GetOrCreateOptions {
+								params: Some(serde_json::json!({ "server": s })),
+								..Default::default()
+							},
+						)
 						.context("get vertex worker")?;
 					produced += worker
 						.call(RunSuperstep {
@@ -238,6 +252,7 @@ impl Handles<RunAlgorithm> for Coordinator {
 						.await
 						.context("run worker superstep")?;
 				}
+				info!(round, produced, "coordinator superstep barrier complete");
 				round += 1;
 			}
 
@@ -266,6 +281,7 @@ impl Handles<RunAlgorithm> for Coordinator {
 					}
 				}
 			}
+			info!(rounds, vertices = total, active, "algorithm result persisted");
 			Ok(CoordinatorResult {
 				rounds,
 				vertices: total,

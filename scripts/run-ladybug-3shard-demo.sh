@@ -2,7 +2,7 @@
 # Run the 3-shard (NUM_SERVERS=3) distributed ladybug-graph algorithm demo on Rivet.
 # All progress logs go to stderr; engine logs live in ~/.rivetkit/var/logs/rivet-engine/.
 set -euo pipefail
-cd /home/ubuntu/src/rivet-graph/rivet
+cd "$(dirname "$0")/.."
 
 db=/tmp/foo.db
 url=http://127.0.0.1:8123

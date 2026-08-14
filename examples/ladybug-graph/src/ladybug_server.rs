@@ -258,12 +258,19 @@ async fn rpc(
 // Arrow encoding
 // ---------------------------------------------------------------------------
 
-/// Collects a lbug query result into `Option<Value>` cells (all rows present; nulls remain as
-/// `Some(Value::Null(_))`).
+/// Collects a lbug query result into `Option<Value>` cells (all rows present; a NULL cell becomes
+/// `None` so it carries no type of its own — see [`rows_to_batch`] for why that matters).
 fn collect_query(result: impl IntoIterator<Item = Vec<Value>>) -> Vec<Vec<Option<Value>>> {
 	result
 		.into_iter()
-		.map(|row| row.into_iter().map(Some).collect())
+		.map(|row| {
+			row.into_iter()
+				.map(|value| match value {
+					Value::Null(_) => None,
+					value => Some(value),
+				})
+				.collect()
+		})
 		.collect()
 }
 
@@ -330,9 +337,14 @@ fn rows_to_batch(columns: Vec<String>, rows: &[Vec<Option<Value>>]) -> anyhow::R
 		for row in rows {
 			col_values.push(row.get(c).cloned().flatten());
 		}
+		// A NULL cell says nothing about the column's type, so skip past nulls to the first real
+		// value. Typing the column off a leading NULL would encode every later value as text
+		// (`Int64(42)` arriving at the client as `String("42")`), which the typed readers in
+		// `graph` silently discard rather than reject.
 		let dt = col_values
 			.iter()
-			.find_map(|v| v.as_ref())
+			.flatten()
+			.find(|v| !matches!(v, Value::Null(_)))
 			.map(datatype_of)
 			.unwrap_or(DataType::Utf8);
 

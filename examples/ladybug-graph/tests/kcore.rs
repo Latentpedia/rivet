@@ -1,8 +1,8 @@
 //! End-to-end tests for the distributed message-passing graph algorithms.
 //!
-//! Each test stands up a real LadybugDB server on an ephemeral port and drives `NUM_SERVERS`
+//! Each test stands up a real LadybugDB server on an ephemeral port and drives `num_servers`
 //! shard workers against it. The workers talk to the store (and so to each other) only through
-//! the remote ADBC bridge, mirroring how `NUM_SERVERS` separate Rivet servers would exchange
+//! the remote ADBC bridge, mirroring how `num_servers` separate Rivet servers would exchange
 //! messages over the graph database across machines.
 
 use std::collections::HashSet;
@@ -34,7 +34,7 @@ impl TestServer {
 
 fn active_ids(db: &mut GraphDb) -> HashSet<i64> {
 	let mut ids = HashSet::new();
-	for shard in 0..example_ladybug_graph::graph::NUM_SERVERS {
+	for shard in 0..example_ladybug_graph::graph::num_servers() {
 		for v in db.read_vertices(shard).unwrap() {
 			if v.active {
 				ids.insert(v.id);
@@ -46,7 +46,7 @@ fn active_ids(db: &mut GraphDb) -> HashSet<i64> {
 
 fn component_label(db: &mut GraphDb) -> HashSet<i64> {
 	let mut labels = HashSet::new();
-	for shard in 0..example_ladybug_graph::graph::NUM_SERVERS {
+	for shard in 0..example_ladybug_graph::graph::num_servers() {
 		for v in db.read_vertices(shard).unwrap() {
 			labels.insert(v.value);
 		}
@@ -177,4 +177,42 @@ fn empty_graph_converges() {
 	let outcome = Coordinator::new(db).run(Algorithm::KCore { k: 1 }).unwrap();
 	assert_eq!(outcome.vertices.len(), 0);
 	assert!(outcome.rounds >= 1);
+}
+
+/// Vertex placement, message routing and the coordinator's barrier must all agree on how many
+/// shards exist. If the coordinator drives fewer shards than the router used, the extra shards are
+/// never polled: their vertices never peel and the messages aimed at them are never consumed, with
+/// no error raised anywhere. Sweeping the shards the coordinator would drive has to account for
+/// every vertex in the store, and for every message the router placed.
+#[test]
+fn every_vertex_and_message_lands_on_a_shard_the_coordinator_drives() {
+	let server = TestServer::new();
+	let mut db = server.open_db();
+	db.create_schema().unwrap();
+	db.start_run(6, 2).unwrap();
+	seed_demo_graph(&mut db).unwrap();
+
+	let shards = example_ladybug_graph::graph::num_servers();
+	let swept: i64 = (0..shards)
+		.map(|shard| db.read_vertices(shard).unwrap().len() as i64)
+		.sum();
+	assert_eq!(
+		swept,
+		db.count_vertex().unwrap(),
+		"sweeping shards 0..{shards} must reach every seeded vertex"
+	);
+
+	// Route one message at every vertex and check the coordinator's sweep collects them all.
+	for v in 0..8i64 {
+		db.write_msg_round(v, example_ladybug_graph::algorithm::kind::DECREMENT, 1, 0)
+			.unwrap();
+	}
+	let routed: i64 = (0..shards)
+		.map(|shard| db.read_msgs_round(shard, 0).unwrap().len() as i64)
+		.sum();
+	assert_eq!(
+		routed,
+		db.count_msgs().unwrap(),
+		"every routed message must land on a shard the coordinator polls"
+	);
 }

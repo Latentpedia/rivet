@@ -1,7 +1,7 @@
 //! Standalone demo of the `ladybug-graph` platform.
 //!
 //! Builds a small graph, seeds it into a LadybugDB store served by an in-process `ladybug-server`
-//! on an ephemeral port, then runs the requested message-passing algorithm across `NUM_SERVERS`
+//! on an ephemeral port, then runs the requested message-passing algorithm across `num_servers`
 //! concurrent worker "servers" that connect to that store and exchange messages only through the
 //! remote ADBC interface (see [`adbc`]). This runs without the Rivet engine; the [`actors`] module
 //! wraps the exact same compute as Rivet actors for the multi-process deployment driven by
@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use std::sync::{Arc, Mutex};
 
 use example_ladybug_graph::algorithm::Algorithm;
-use example_ladybug_graph::graph::{GraphDb, NUM_SERVERS, seed_demo_graph};
+use example_ladybug_graph::graph::{GraphDb, num_servers, seed_demo_graph};
 use example_ladybug_graph::ladybug_server::{LadybugServer, ServerHandle};
 
 const MAX_SUPERSTEPS: i64 = 10_000;
@@ -40,7 +40,7 @@ fn run_parallel(
 			bail!("algorithm did not converge within {MAX_SUPERSTEPS} supersteps");
 		}
 		let results: Vec<i64> = std::thread::scope(|scope| {
-			let handles: Vec<_> = (0..NUM_SERVERS)
+			let handles: Vec<_> = (0..num_servers())
 				.map(|shard| {
 					let shared = shared.clone();
 					scope.spawn(move || -> Result<i64> {
@@ -64,7 +64,7 @@ fn run_parallel(
 	// Finalize survivors and gather the outcome.
 	let mut db = shared.lock().unwrap();
 	if let Algorithm::KCore { k } = algo {
-		for shard in 0..NUM_SERVERS {
+		for shard in 0..num_servers() {
 			for v in db.read_vertices(shard)? {
 				if v.active {
 					db.persist_vertex(&example_ladybug_graph::graph::Vertex { core: k, ..v })?;
@@ -74,7 +74,7 @@ fn run_parallel(
 	}
 	db.clear_msgs()?;
 	let mut vertices = Vec::new();
-	for shard in 0..NUM_SERVERS {
+	for shard in 0..num_servers() {
 		vertices.extend(db.read_vertices(shard)?);
 	}
 	vertices.sort_by_key(|v| v.id);
@@ -119,7 +119,8 @@ fn main() -> Result<()> {
 		db_path.display()
 	);
 	println!(
-		"seeded demo graph across {NUM_SERVERS} shard servers (server-owned store at {})",
+		"seeded demo graph across {} shard servers (server-owned store at {})",
+		num_servers(),
 		handle.url
 	);
 

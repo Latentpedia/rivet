@@ -18,7 +18,9 @@
 //!
 //! - `LADYBUG_DB` — LadybugDB server URL (for example `http://127.0.0.1:8123`).
 //! - `SERVER_ID` — this process's shard index (used by a worker).
-//! - `NUM_SERVERS` — total shard count (used by a coordinator).
+//! - `NUM_SERVERS` — total shard count. Read through [`crate::graph::num_servers`], the single
+//!   place that decides it, so vertex placement, message routing and the coordinator's barrier all
+//!   agree on how many shards exist.
 //! - `GRAPH_RUN_ID`, `GRAPH_K`, `GRAPH_ALGO` — coordinator run parameters.
 
 use std::{
@@ -234,10 +236,10 @@ impl Handles<RunAlgorithm> for Coordinator {
 	fn handle(self: Arc<Self>, ctx: Ctx<Self>, action: RunAlgorithm) -> Self::Future {
 		Box::pin(async move {
 			let _ensure_store = shared_db()?;
-			let num_servers: i64 = std::env::var("NUM_SERVERS")
-				.ok()
-				.and_then(|s| s.parse().ok())
-				.unwrap_or(3);
+			// The same shard count that routed the vertices and messages, not a second reading of
+			// the environment: a coordinator driving fewer shards than the router used would leave
+			// a shard unpolled, and its vertices would silently never peel.
+			let num_servers = crate::graph::num_servers();
 			let algo = algo(action.algo_idx, action.k)?;
 
 			// The control plane: reach every worker actor across the servers via Rivet.

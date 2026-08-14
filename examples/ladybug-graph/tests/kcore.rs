@@ -1,14 +1,36 @@
 //! End-to-end tests for the distributed message-passing graph algorithms.
 //!
-//! Each test drives `NUM_SERVERS` shard workers against a single shared LadybugDB store. The
-//! workers talk to the store (and so to each other) only through the ADBC bridge, mirroring how
-//! `NUM_SERVERS` separate Rivet servers would exchange messages over the graph database.
+//! Each test stands up a real LadybugDB server on an ephemeral port and drives `NUM_SERVERS`
+//! shard workers against it. The workers talk to the store (and so to each other) only through
+//! the remote ADBC bridge, mirroring how `NUM_SERVERS` separate Rivet servers would exchange
+//! messages over the graph database across machines.
 
 use std::collections::HashSet;
 
 use example_ladybug_graph::algorithm::{Algorithm, Coordinator};
 use example_ladybug_graph::graph::{GraphDb, seed_demo_graph};
+use example_ladybug_graph::ladybug_server::{LadybugServer, ServerHandle};
 use tempfile::TempDir;
+
+/// A real LadybugDB server process (in-thread) with a unique on-disk store per test, so every
+/// test exercises the full remote columnar protocol rather than an embedded shortcut.
+struct TestServer {
+	_dir: TempDir,
+	handle: ServerHandle,
+}
+
+impl TestServer {
+	fn new() -> TestServer {
+		let dir = TempDir::new().unwrap();
+		let server = LadybugServer::open(dir.path().join("graph.lbdb")).unwrap();
+		let handle = ServerHandle::start(server).unwrap();
+		TestServer { _dir: dir, handle }
+	}
+
+	fn open_db(&self) -> GraphDb {
+		GraphDb::open(&self.handle.url).unwrap()
+	}
+}
 
 fn active_ids(db: &mut GraphDb) -> HashSet<i64> {
 	let mut ids = HashSet::new();
@@ -34,10 +56,8 @@ fn component_label(db: &mut GraphDb) -> HashSet<i64> {
 
 #[test]
 fn kcore2_computes_and_persists() {
-	let dir = TempDir::new().unwrap();
-	let path = dir.path().join("kcore2.lbdb");
-
-	let mut db = GraphDb::open(&path).unwrap();
+	let server = TestServer::new();
+	let mut db = server.open_db();
 	db.create_schema().unwrap();
 	db.start_run(1, 2).unwrap();
 	let _seeded = seed_demo_graph(&mut db).unwrap();
@@ -51,33 +71,42 @@ fn kcore2_computes_and_persists() {
 		.filter(|v| v.active)
 		.map(|v| v.id)
 		.collect();
-	assert_eq!(active, HashSet::from([0, 1, 2, 3, 4]), "2-core should keep the house");
+	assert_eq!(
+		active,
+		HashSet::from([0, 1, 2, 3, 4]),
+		"2-core should keep the house"
+	);
 	let removed: HashSet<i64> = outcome
 		.vertices
 		.iter()
 		.filter(|v| !v.active)
 		.map(|v| v.id)
 		.collect();
-	assert_eq!(removed, HashSet::from([5, 6, 7]), "pendant tail should be peeled");
+	assert_eq!(
+		removed,
+		HashSet::from([5, 6, 7]),
+		"pendant tail should be peeled"
+	);
 
 	// Survivors carry core == k.
 	for v in outcome.vertices.iter().filter(|v| v.active) {
 		assert_eq!(v.core, 2, "survivor {} should record core 2", v.id);
 	}
-	assert!(outcome.rounds >= 2, "message passing should take >= 2 supersteps");
+	assert!(
+		outcome.rounds >= 2,
+		"message passing should take >= 2 supersteps"
+	);
 
-	// Results are persisted in LadybugDB: reopen the store from disk and read them back.
-	let mut reopened = GraphDb::open(&path).unwrap();
+	// Results are persisted in LadybugDB: reopen the remote store and read them back.
+	let mut reopened = server.open_db();
 	assert_eq!(active_ids(&mut reopened), HashSet::from([0, 1, 2, 3, 4]));
 	assert_eq!(reopened.count_vertex().unwrap(), 8);
 }
 
 #[test]
 fn kcore3_empties_the_core() {
-	let dir = TempDir::new().unwrap();
-	let path = dir.path().join("kcore3.lbdb");
-
-	let mut db = GraphDb::open(&path).unwrap();
+	let server = TestServer::new();
+	let mut db = server.open_db();
 	db.create_schema().unwrap();
 	db.start_run(2, 3).unwrap();
 	let _seeded = seed_demo_graph(&mut db).unwrap();
@@ -93,10 +122,8 @@ fn kcore3_empties_the_core() {
 
 #[test]
 fn wcc_finds_a_single_component() {
-	let dir = TempDir::new().unwrap();
-	let path = dir.path().join("wcc.lbdb");
-
-	let mut db = GraphDb::open(&path).unwrap();
+	let server = TestServer::new();
+	let mut db = server.open_db();
 	db.create_schema().unwrap();
 	db.start_run(3, 0).unwrap();
 	let _seeded = seed_demo_graph(&mut db).unwrap();
@@ -105,36 +132,46 @@ fn wcc_finds_a_single_component() {
 
 	// The demo graph is connected, so every vertex converges to the single smallest label (0).
 	assert_eq!(
-		outcome.vertices.iter().map(|v| v.value).collect::<HashSet<_>>(),
+		outcome
+			.vertices
+			.iter()
+			.map(|v| v.value)
+			.collect::<HashSet<_>>(),
 		HashSet::from([0]),
 		"connected graph should collapse to one component"
 	);
 	// Persisted.
-	let mut reopened = GraphDb::open(&path).unwrap();
+	let mut reopened = server.open_db();
 	assert_eq!(component_label(&mut reopened), HashSet::from([0]));
 }
 
 #[test]
 fn wcc_splits_disconnected_graph() {
-	let dir = TempDir::new().unwrap();
-	let path = dir.path().join("wcc2.lbdb");
-
-	let mut db = GraphDb::open(&path).unwrap();
+	let server = TestServer::new();
+	let mut db = server.open_db();
 	db.create_schema().unwrap();
 	db.start_run(4, 0).unwrap();
 	// Two disconnected triangles.
-	example_ladybug_graph::graph::seed_edges(&mut db, &[(0, 1), (1, 2), (2, 0), (10, 11), (11, 12), (12, 10)])
-		.unwrap();
+	example_ladybug_graph::graph::seed_edges(
+		&mut db,
+		&[(0, 1), (1, 2), (2, 0), (10, 11), (11, 12), (12, 10)],
+	)
+	.unwrap();
 
 	let outcome = Coordinator::new(db).run(Algorithm::Wcc).unwrap();
 	let labels: HashSet<i64> = outcome.vertices.iter().map(|v| v.value).collect();
-	assert_eq!(labels, HashSet::from([0, 10]), "two components -> two labels");
+	assert_eq!(
+		labels,
+		HashSet::from([0, 10]),
+		"two components -> two labels"
+	);
 }
 
 /// The pure-DB algorithm must tolerate an empty graph (converges in one round, no error).
 #[test]
 fn empty_graph_converges() {
-	let mut db = GraphDb::in_memory().unwrap();
+	let server = TestServer::new();
+	let mut db = server.open_db();
 	db.create_schema().unwrap();
 	db.start_run(5, 1).unwrap();
 	let outcome = Coordinator::new(db).run(Algorithm::KCore { k: 1 }).unwrap();

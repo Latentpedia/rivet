@@ -1,16 +1,17 @@
 //! A Rivet server process for the ladybug-graph platform.
 //!
-//! Each of the `NUM_SERVERS` local servers runs this binary. They all point at the same shared
-//! LadybugDB file (`LADYBUG_DB`) and the same Rivet engine, and each hosts a [`VertexWorker`]
-//! actor plus the [`Coordinator`] actor, so Rivet provides the cross-process control plane while
-//! the graph message passing runs over `adbc_core`.
+//! Each of the `NUM_SERVERS` local servers runs this binary. They all connect over HTTP to the
+//! same LadybugDB server (`LADYBUG_DB` is its URL) and the same Rivet engine, and each hosts a
+//! [`VertexWorker`] actor plus the [`Coordinator`] actor, so Rivet provides the cross-process
+//! control plane while the graph message passing runs over `adbc_core` against the remote store.
 //!
 //! Subcommands:
 //!
 //! - `serve` (default) — host the worker + coordinator actors. Once the actors are reachable, a
 //!   client task triggers `runAlgorithm` (disable with `GRAPH_AUTO_RUN=0`) so the computation runs
 //!   and its progress is visible in the logs.
-//! - `seed <db> <k>` — create the schema and seed the demo graph once (before starting servers).
+//! - `seed <url> <k>` — create the schema and seed the demo graph once (before starting servers),
+//!   sent to the ladybug server at `<url>` over the columnar protocol.
 
 use std::time::Duration;
 
@@ -34,13 +35,11 @@ fn init_logging() {
 /// Builds the client used to trigger the algorithm, mirroring the actor-runtime client config so
 /// the trigger talks to the same engine, namespace, and pool as the hosted actors.
 fn trigger_client() -> Result<rivetkit::client::Client> {
-	let endpoint = std::env::var("RIVET_ENDPOINT")
-		.unwrap_or_else(|_| "http://127.0.0.1:6420".to_owned());
+	let endpoint =
+		std::env::var("RIVET_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:6420".to_owned());
 	let token = std::env::var("RIVET_TOKEN").ok();
-	let namespace =
-		std::env::var("RIVET_NAMESPACE").unwrap_or_else(|_| "default".to_owned());
-	let pool_name =
-		std::env::var("RIVET_POOL_NAME").unwrap_or_else(|_| "rivetkit-rust".to_owned());
+	let namespace = std::env::var("RIVET_NAMESPACE").unwrap_or_else(|_| "default".to_owned());
+	let pool_name = std::env::var("RIVET_POOL_NAME").unwrap_or_else(|_| "rivetkit-rust".to_owned());
 	Ok(rivetkit::client::Client::new(
 		ClientConfig::new(endpoint)
 			.token_opt(token)
@@ -53,9 +52,18 @@ fn trigger_client() -> Result<rivetkit::client::Client> {
 /// Waits for the engine to accept the coordinator actor, then runs the algorithm once and logs the
 /// result. Retries until the first successful run so the trigger survives slow envoy startup.
 async fn trigger_algorithm() {
-	let run_id: i64 = std::env::var("GRAPH_RUN_ID").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-	let k: i64 = std::env::var("GRAPH_K").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
-	let algo_idx: i64 = std::env::var("GRAPH_ALGO").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+	let run_id: i64 = std::env::var("GRAPH_RUN_ID")
+		.ok()
+		.and_then(|v| v.parse().ok())
+		.unwrap_or(1);
+	let k: i64 = std::env::var("GRAPH_K")
+		.ok()
+		.and_then(|v| v.parse().ok())
+		.unwrap_or(2);
+	let algo_idx: i64 = std::env::var("GRAPH_ALGO")
+		.ok()
+		.and_then(|v| v.parse().ok())
+		.unwrap_or(1);
 
 	for attempt in 0..120u32 {
 		match try_run_algorithm(run_id, k, algo_idx).await {
@@ -80,14 +88,26 @@ async fn trigger_algorithm() {
 	}
 }
 
-async fn try_run_algorithm(run_id: i64, k: i64, algo_idx: i64) -> Result<example_ladybug_graph::actors::CoordinatorResult> {
+async fn try_run_algorithm(
+	run_id: i64,
+	k: i64,
+	algo_idx: i64,
+) -> Result<example_ladybug_graph::actors::CoordinatorResult> {
 	let client = trigger_client()?;
 	let coordinator = client
-		.get_or_create_typed::<Coordinator>(COORDINATOR_ACTOR, Vec::<String>::new(), Default::default())
+		.get_or_create_typed::<Coordinator>(
+			COORDINATOR_ACTOR,
+			Vec::<String>::new(),
+			Default::default(),
+		)
 		.context("get graph coordinator")?;
 	info!(run_id, k, algo_idx, "triggering runAlgorithm");
 	let result = coordinator
-		.call(RunAlgorithm { run_id, k, algo_idx })
+		.call(RunAlgorithm {
+			run_id,
+			k,
+			algo_idx,
+		})
 		.await
 		.context("run distributed algorithm")?;
 	Ok(result)
@@ -104,12 +124,12 @@ async fn serve() -> Result<()> {
 	example_ladybug_graph::actors::registry().start().await
 }
 
-fn seed(db_path: &str, k: i64) -> Result<()> {
-	let mut db = example_ladybug_graph::graph::GraphDb::open(db_path)?;
+fn seed(url: &str, k: i64) -> Result<()> {
+	let mut db = example_ladybug_graph::graph::GraphDb::open(url)?;
 	db.create_schema()?;
 	db.start_run(1, k)?;
 	example_ladybug_graph::graph::seed_demo_graph(&mut db)?;
-	println!("seeded demo graph at {db_path}");
+	println!("seeded demo graph at {url}");
 	Ok(())
 }
 
@@ -119,9 +139,9 @@ async fn main() -> Result<()> {
 	let mut args = std::env::args().skip(1);
 	match args.next().as_deref() {
 		Some("seed") => {
-			let db = args.next().context("seed requires <db>")?;
+			let url = args.next().context("seed requires <url>")?;
 			let k = args.next().and_then(|s| s.parse().ok()).unwrap_or(2);
-			seed(&db, k)
+			seed(&url, k)
 		}
 		_ => serve().await.context("serve the platform actors"),
 	}

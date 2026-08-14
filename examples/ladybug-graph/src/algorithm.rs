@@ -31,7 +31,7 @@
 
 use anyhow::{Context, Result, bail};
 
-use crate::graph::{GraphDb, Vertex, NUM_SERVERS};
+use crate::graph::{GraphDb, NUM_SERVERS, Vertex};
 
 /// Message kinds written to the shared `Msg` table.
 pub mod kind {
@@ -108,7 +108,8 @@ fn run_vertex(
 					active: false,
 					..v.clone()
 				};
-				db.persist_vertex(&removed).context("persist k-core removal")?;
+				db.persist_vertex(&removed)
+					.context("persist k-core removal")?;
 				for n in db.neighbors(v.id)? {
 					db.write_msg_round(n, kind::DECREMENT, 1, round)?;
 					*produced += 1;
@@ -197,7 +198,9 @@ impl Coordinator {
 				for v in self.db.read_vertices(shard)? {
 					if v.active {
 						let survivor = Vertex { core: k, ..v };
-						self.db.persist_vertex(&survivor).context("set survivor core")?;
+						self.db
+							.persist_vertex(&survivor)
+							.context("set survivor core")?;
 					}
 				}
 			}

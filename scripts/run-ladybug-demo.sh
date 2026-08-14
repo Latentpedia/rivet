@@ -41,11 +41,21 @@ case "$mode" in
     echo "building engine + example (one-time)..." >&2
     cargo build --release -p rivet-engine -p example-ladybug-graph
     db="${RIVET_LADYBUG_DB:-$(mktemp -d)/cluster.lbdb}"
+    url="${RIVET_LADYBUG_URL:-http://127.0.0.1:8123}"
     k="${RIVET_K:-2}"
-    echo "seeding graph at $db (k=$k)..." >&2
-    ./target/release/server seed "$db" "$k"
-    echo "building done. Host worker+coordinator actors in one Rivet host process (one embedded store) and trigger runAlgorithm:" >&2
+    echo "starting ladybug server on $url backed by $db (k=$k)..." >&2
+    ./target/release/ladybug-server --db "$db" --listen "${url#http://}" &
+    LADYBUG_SERVER_PID=$!
+    trap 'kill "$LADYBUG_SERVER_PID" 2>/dev/null || true' EXIT
+    for _ in $(seq 1 50); do
+      curl -fsS "$url/health" >/dev/null 2>&1 && break
+      sleep 0.1
+    done
+    echo "seeding graph through the columnar protocol at $url (k=$k)..." >&2
+    ./target/release/server seed "$url" "$k"
+    echo "building done. Host worker+coordinator actors in one Rivet host process (remote clients of" >&2
+    echo "the ladybug server) and trigger runAlgorithm:" >&2
     echo "  export RIVET_ENGINE_BINARY_PATH=\$PWD/target/release/rivet-engine" >&2
-    echo "  LADYBUG_DB=\$db NUM_SERVERS=3 ./target/release/server" >&2
+    echo "  LADYBUG_DB=\$url NUM_SERVERS=3 ./target/release/server" >&2
     ;;
 esac

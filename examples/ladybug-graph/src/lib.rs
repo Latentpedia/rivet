@@ -6,9 +6,12 @@
 //! - [`props`] — strongly typed node/relationship property builders (the [`props!`] macro and a
 //!   schema-checked [`props::TypedProps`]), so persisting application objects is not error-prone
 //!   hand-rolled `Vec<(String, Value)>`.
-//! - [`adbc`] — the ADBC bridge over the universalDB `LadybugDatabaseDriver`. It is the
-//!   inter-instance data plane: every message passing and result persistence read/write between
-//!   Rivet servers flows through [`adbc_core`] and returns Arrow result sets.
+//! - [`adbc`] — the ADBC driver over the remote LadybugDB server (a client of [`ladybug_server`]).
+//!   It is the inter-instance data plane: every message passing and result persistence read/write
+//!   between Rivet servers flows through [`adbc_core`] and returns Arrow result sets.
+//! - [`ladbug_server`](ladybug_server) — the server process that owns the graph file and serves the
+//!   columnar ADBC protocol (Arrow IPC over HTTP) to remote clients.
+//! - [`protocol`] — the wire contract shared by the server and the ADBC client.
 //! - [`graph`] — the strongly typed application layer over ADBC: declares node/rel table schemas,
 //!   persists typed rows, and reads them back as typed objects.
 //! - [`algorithm`] — distributed message-passing graph algorithms (k-core, weak connectivity) run
@@ -23,8 +26,10 @@
 //! [`actors`] module and `bin/server.rs` build the same algorithm as a multi-process Rivet
 //! deployment (see `scripts/run-ladybug-demo.sh`).
 
-pub mod adbc;
 pub mod actors;
+pub mod adbc;
 pub mod algorithm;
 pub mod graph;
+pub mod ladybug_server;
 pub mod props;
+mod protocol;

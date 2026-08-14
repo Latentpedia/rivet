@@ -8,7 +8,10 @@
 //!
 //! [`GraphDb`] is a thin facade over an ADBC database handle. It does not know anything about
 //! graph algorithms; it only knows the table schemas and gives the [`crate::algorithm`] layer
-//! typed operations over them, all backed by [`adbc_core`].
+//! typed operations over them, all backed by [`adbc_core`]. The handle is a **remote client**:
+//! every operation is a parameterized Cypher statement sent to the server-owned store over the
+//! columnar protocol in [`crate::ladybug_server`], so a [`GraphDb`] can live in a different
+//! machine than the store it reads and writes.
 
 use anyhow::{Result, bail};
 use lbug::Value;
@@ -107,16 +110,11 @@ pub struct GraphDb {
 }
 
 impl GraphDb {
-	pub fn open(path: impl Into<std::path::PathBuf>) -> Result<Self> {
-		let mut driver = LadybugDriver::new(path.into());
-		let db = driver
-			.new_database()
-			.map_err(|e| anyhow::anyhow!("adbc open failed: {e}"))?;
-		Ok(GraphDb { db })
-	}
-
-	pub fn in_memory() -> Result<Self> {
-		let mut driver = LadybugDriver::in_memory();
+	/// Opens a facade addressed to the LadybugDB server at `url` (for example
+	/// `http://127.0.0.1:8123`). The store itself is owned by that server process; every read and
+	/// write flows to it over the columnar ADBC protocol.
+	pub fn open(url: impl Into<String>) -> Result<Self> {
+		let mut driver = LadybugDriver::new(url.into());
 		let db = driver
 			.new_database()
 			.map_err(|e| anyhow::anyhow!("adbc open failed: {e}"))?;
@@ -230,7 +228,9 @@ impl GraphDb {
 	}
 
 	pub fn count_vertex(&mut self) -> Result<i64> {
-		Ok(self.scalar_i64("MATCH (v:Vertex) RETURN count(v)")?.unwrap_or(0))
+		Ok(self
+			.scalar_i64("MATCH (v:Vertex) RETURN count(v)")?
+			.unwrap_or(0))
 	}
 
 	// -- message passing (the ADBC inter-instance channel) --------------------
@@ -239,7 +239,13 @@ impl GraphDb {
 	/// worker can read exactly the messages aimed at its own shard, and the `round` column keeps
 	/// superstep barriers clean: a message is only consumed by the worker for the shard+round it
 	/// targets.
-	pub fn write_msg_round(&mut self, to_id: i64, kind: i64, payload: i64, round: i64) -> Result<()> {
+	pub fn write_msg_round(
+		&mut self,
+		to_id: i64,
+		kind: i64,
+		payload: i64,
+		round: i64,
+	) -> Result<()> {
 		let server = to_id % NUM_SERVERS;
 		self.update(&format!(
 			"CREATE (:Msg {{to_id: {to_id}, server: {server}, kind: {kind}, payload: {payload}, round: {round}}})"
@@ -281,12 +287,16 @@ impl GraphDb {
 	}
 
 	pub fn count_msgs(&mut self) -> Result<i64> {
-		Ok(self.scalar_i64("MATCH (m:Msg) RETURN count(m)")?.unwrap_or(0))
+		Ok(self
+			.scalar_i64("MATCH (m:Msg) RETURN count(m)")?
+			.unwrap_or(0))
 	}
 
 	pub fn count_msgs_round(&mut self, round: i64) -> Result<i64> {
 		Ok(self
-			.scalar_i64(&format!("MATCH (m:Msg) WHERE m.round = {round} RETURN count(m)"))?
+			.scalar_i64(&format!(
+				"MATCH (m:Msg) WHERE m.round = {round} RETURN count(m)"
+			))?
 			.unwrap_or(0))
 	}
 
@@ -335,7 +345,11 @@ impl GraphDb {
 	pub fn persist_vertex(&mut self, v: &Vertex) -> Result<()> {
 		self.update(&format!(
 			"MATCH (x:Vertex {{id: {}}}) SET x.value = {}, x.core = {}, x.active = {}, x.degree = {}",
-			v.id, v.value, v.core, bool_literal(v.active), v.degree
+			v.id,
+			v.value,
+			v.core,
+			bool_literal(v.active),
+			v.degree
 		))
 	}
 }
@@ -351,11 +365,7 @@ fn literal(value: &Value) -> String {
 }
 
 fn bool_literal(b: bool) -> String {
-	if b {
-		"true".into()
-	} else {
-		"false".into()
-	}
+	if b { "true".into() } else { "false".into() }
 }
 
 /// Seeds a small, interesting graph used by the demo and tests. Returns the seeded vertices.

@@ -6,8 +6,9 @@ store over the **`adbc_core`** (ADBC / Arrow Database Connectivity) interface.
 
 ```
                  ┌────────────────────────────────────────────────────┐
-                 │               LadybugDB graph store                 │
-                 │   Vertex / Edge / Msg / Run node+rel tables         │
+                 │            ladybug-server (single writer)          │
+                 │   Owner of the graph file, Arrow IPC over HTTP     │
+                 │   Vertex / Edge / Msg / Run node+rel tables        │
                  └──────▲──────────────▲──────────────▲────────────────┘
                         │  ADBC        │  ADBC        │  ADBC
               (Arrow)   │              │              │   (Arrow)
@@ -19,23 +20,28 @@ store over the **`adbc_core`** (ADBC / Arrow Database Connectivity) interface.
 
 - **Rivet** provides the platform: actor lifecycle and the cross-worker control plane (the
   `Coordinator` invoking each `VertexWorker`'s superstep action).
+- **`ladybug-server`** owns the graph file. LadybugDB is an embedded, single-writer-per-file
+  store, so exactly one process opens it; that process exposes it to the world.
 - **`adbc_core`** provides the inter-instance data plane: workers never talk directly; their only
-  channel is the shared graph store, and every read/write through that channel goes through the
-  ADBC `Statement` interface (Arrow result sets).
+  channel is the shared graph store served by `ladybug-server`. Every read/write through that
+  channel goes through the ADBC `Statement` interface (Arrow result sets) over the wire.
 
 ## Why these pieces
 
+- **Real remote access over a columnar protocol.** The old design was entirely local: every worker
+  opened the same embedded file in-process, which both prevented cross-machine distribution and
+  forced a shared-file/global-lock model. Now `ladybug-server` is a standalone process that owns
+  the store, and the ADBC driver (`src/adbc.rs`) is a client of it. The wire format is a tiny
+  typed-JSON request envelope (`POST /rpc`, query text + named scalar bindings) and an **Arrow IPC
+  stream** response (`application/vnd.apache.arrow.stream`) for reads, so result sets stay columnar
+  across the network instead of paying row-by-row JSON overhead. Any number of worker/coordinator
+  processes on any number of machines can share the one server-owned store.
 - **Strongly typed application loading** (`src/props.rs`, `src/graph.rs`). Hand-rolling
   `Vec<(String, lbug::Value)>` property vectors is error prone (stringly-typed keys, manual
   `Value::Int64(...)` wrapping, no cross-check with the schema). Applications instead declare their
   node tables once as [`props::Table`](src/props.rs) schemas and build every row from a typed Rust
   object through the [`props!`](src/props.rs) macro / [`props::TypedProps`](src/props.rs), which
   reject unknown keys and wrong value types before anything reaches the store.
-- **`adbc_core` for inter-instance communication** (`src/adbc.rs`). The four ADBC traits
-  (`Driver`, `Database`, `Connection`, `Statement`) are implemented over the LadybugDB graph store.
-  A worker "sends a message" via `execute_update` (a `CREATE` into the shared `Msg` table) and
-  "receives" via `execute` (a `MATCH` returning Arrow), so Arrow is the encoding that crosses the
-  boundary on both sides of every worker.
 - **Superstep message passing** (`src/algorithm.rs`). Pregel-style barrier rounds over the shared
   `Msg` table, with a `round` column keeping the barrier clean across shards.
   - `KCore { k }` — peeling: a vertex whose effective degree drops below `k` leaves the core and
@@ -44,14 +50,43 @@ store over the **`adbc_core`** (ADBC / Arrow Database Connectivity) interface.
   - `Wcc` — components: a vertex adopts the smallest component label it hears and propagates the
     improvement (persisted in `value`).
 - **Persistence** — every algorithm ends by persisting its result back into the graph (`Vertex`
-  rows), verified by re-opening the on-disk store.
+  rows), verified by re-opening the store.
+
+## How the columnar RPC works
+
+`ladybug-server` (binary `ladybug-server`, module `src/ladybug_server.rs`) serves two endpoints:
+
+- `GET /health` — liveness probe.
+- `POST /rpc` — one endpoint for reads and writes. The request is `{ kind, cypher, params }` where
+  `params` are named, type-tagged scalars (so the server rebinds `$name` placeholders losslessly on
+  a prepared statement). A `kind: "query"` response is an Arrow IPC stream of the result batches; a
+  `kind: "update"` returns a small JSON ack. Server-side query errors come back as a JSON
+  `{ "error": ... }` body with a 4xx/5xx status.
+
+The ADBC driver (`src/adbc.rs`) implements the four ADBC traits (`Driver`, `Database`,
+`Connection`, `Statement`) as a client of this protocol:
+
+- `Statement::execute` POSTs a `query` and streams the `RecordBatch`es straight off the Arrow IPC
+  body, so the columnar data never degrades to rows on the wire.
+- `Statement::execute_update` POSTs an `update`.
+- The client keeps one pooled HTTP connection per database, which the many per-round superstep
+  queries reuse.
+
+The server runs reads concurrently (the engine synchronizes connections internally) and serializes
+writes behind one process-wide lock, which is exactly the single-writer guarantee the embedded
+engine requires. `src/protocol.rs` holds the wire contract shared by both sides.
 
 ## Run
 
 ```sh
-# Fully automated: NUM_SERVERS shard workers over a shared on-disk store (no engine needed).
-scripts/run-ladybug-demo.sh kcore 2
+# Standalone demo (no engine): spins up an in-process ladybug-server on an ephemeral port and
+# runs the algorithm over the remote columnar protocol.
+scripts/run-ladybug-demo.sh kcore 2      # k-core with k=2 (default)
 scripts/run-ladybug-demo.sh wcc
+
+# Rivet actor deployment: start the ladybug server, seed, then host the actors as remote clients.
+./target/release/ladybug-server --db /tmp/cluster.lbdb --listen 127.0.0.1:8123 &
+LADYBUG_DB=http://127.0.0.1:8123 NUM_SERVERS=3 ./target/release/server
 
 # Tests (release profile keeps the debug dir small).
 cargo test -p example-ladybug-graph --release
@@ -65,25 +100,25 @@ converged after 4 supersteps (8 vertices)
   vertex  7  server 1  degree 0  core 2  [OUT]   <- pendant tail peeled off by message passing
 ```
 
-## The embedded-store constraint (important)
+## The single-writer-served-store constraint
 
-LadybugDB is an **embedded, single-instance-per-file** store: exactly one `lbug` instance may hold
-a database file open at a time, and a second instance opening the same path corrupts the
-write-ahead log. So each process opens the store **once** and shares the handle across all of its
-workers (see the process-wide `shared_db()` in `src/actors.rs`); the superstep model serializes
-writers through the single store while the ADBC surface fans many connections out on top of it.
-True multi-process / multi-node sharing of the *same embedded file* is not supported. For that, run
-LadybugDB as a **remote server** and connect each Rivet worker over its URL (`lbug` supports
-`Database::new("http://host:port")`, per the ladybug skill) — then the workers can live in separate
-processes while the single remote store still mediates their ADBC message passing.
+LadybugDB is an embedded store: exactly one `lbug` instance may hold a database file open at a
+time, and a second instance opening the same path corrupts the write-ahead log. The `ladybug-server`
+process is that one instance. Every other component is a remote client that holds no file handle,
+so the constraint is contained to a single process while the rest of the platform is free to
+distribute. This is why `LADYBUG_DB` is a URL, not a path: actors, the seed command, and the
+standalone demo all point at the server and talk to it through `adbc_core`.
 
 ## Modules
 
 | File | Role |
 |------|------|
+| `src/protocol.rs` | the wire contract shared by server and client (`POST /rpc`, typed params, Arrow IPC responses) |
+| `src/ladybug_server.rs` | the server process: owns the lbug file, serializes writers, encodes Arrow IPC |
+| `src/adbc.rs` | the ADBC client driver over the remote columnar protocol |
 | `src/props.rs` | strongly typed property builders (`props!`, `TypedProps`, `Table`) |
-| `src/adbc.rs`  | `adbc_core` `Driver`/`Database`/`Connection`/`Statement` over LadybugDB + Arrow encode/decode |
 | `src/graph.rs` | typed application layer: table schemas, `Vertex`/`Msg`/`Run` rows, `GraphDb` facade |
 | `src/algorithm.rs` | superstep engine + `KCore` / `Wcc` + coordinator |
 | `src/actors.rs` | Rivet `VertexWorker` / `Coordinator` actors (control plane over Rivet) |
+| `src/bin/ladybug-server.rs` | the LadybugDB server binary |
 | `src/bin/server.rs` | one Rivet host process serving the workers + coordinator |

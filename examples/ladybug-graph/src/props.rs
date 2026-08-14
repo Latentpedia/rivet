@@ -78,10 +78,7 @@ impl Table {
 	pub fn new(label: impl Into<String>, cols: Vec<(&'static str, ColType)>) -> Self {
 		Table {
 			label: label.into(),
-			cols: cols
-				.into_iter()
-				.map(|(n, t)| (n.to_string(), t))
-				.collect(),
+			cols: cols.into_iter().map(|(n, t)| (n.to_string(), t)).collect(),
 		}
 	}
 
@@ -144,9 +141,7 @@ macro_rules! impl_into_value_via_from {
 		}
 	)*};
 }
-impl_into_value_via_from!(
-	i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, String,
-);
+impl_into_value_via_from!(i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, String,);
 impl IntoValue for &str {
 	fn into_lbug_value(self) -> lbug::Value {
 		lbug::Value::String(self.to_string())

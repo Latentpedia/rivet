@@ -1,10 +1,11 @@
 //! Standalone demo of the `ladybug-graph` platform.
 //!
-//! Builds a small graph, seeds it into an on-disk LadybugDB store, then runs the requested
-//! message-passing algorithm across `NUM_SERVERS` concurrent worker "servers" that share the store
-//! and exchange messages only through the ADBC interface (see [`adbc`]). This runs without the
-//! Rivet engine; the [`actors`] module wraps the exact same compute as Rivet actors for the
-//! multi-process deployment driven by `scripts/run-ladybug-demo.sh`.
+//! Builds a small graph, seeds it into a LadybugDB store served by an in-process `ladybug-server`
+//! on an ephemeral port, then runs the requested message-passing algorithm across `NUM_SERVERS`
+//! concurrent worker "servers" that connect to that store and exchange messages only through the
+//! remote ADBC interface (see [`adbc`]). This runs without the Rivet engine; the [`actors`] module
+//! wraps the exact same compute as Rivet actors for the multi-process deployment driven by
+//! `scripts/run-ladybug-demo.sh`.
 //!
 //! Usage:
 //!
@@ -13,20 +14,18 @@
 //! cargo run -p example-ladybug-graph --release -- wcc
 //! ```
 
-
-
 use anyhow::{Context, Result, bail};
 use std::sync::{Arc, Mutex};
 
 use example_ladybug_graph::algorithm::Algorithm;
-use example_ladybug_graph::graph::{GraphDb, seed_demo_graph, NUM_SERVERS};
+use example_ladybug_graph::graph::{GraphDb, NUM_SERVERS, seed_demo_graph};
+use example_ladybug_graph::ladybug_server::{LadybugServer, ServerHandle};
 
 const MAX_SUPERSTEPS: i64 = 10_000;
 
-/// Runs the superstep loop where every shard is a separate thread. All threads share ONE
-/// `LadybugDb` handle (LadybugDB is an embedded single-instance store, so a second `lbug`
-/// instance cannot open the same file concurrently); the per-round `round` column keeps the
-/// barrier clean across shards, and the store serializes writers.
+/// Runs the superstep loop where every shard is a separate thread. All threads share ONE remote
+/// `GraphDb` client; the per-round `round` column keeps the barrier clean across shards, and the
+/// server serializes writers.
 fn run_parallel(
 	shared: Arc<Mutex<GraphDb>>,
 	algo: Algorithm,
@@ -52,7 +51,10 @@ fn run_parallel(
 				.collect();
 			handles
 				.into_iter()
-				.map(|h| h.join().unwrap_or_else(|_| panic!("worker thread panicked")))
+				.map(|h| {
+					h.join()
+						.unwrap_or_else(|_| panic!("worker thread panicked"))
+				})
 				.collect::<Result<Vec<i64>>>()
 		})?;
 		produced = results.iter().sum();
@@ -95,19 +97,31 @@ fn main() -> Result<()> {
 	std::fs::create_dir_all(&dir).context("create demo dir")?;
 	let db_path = dir.join("demo.lbdb");
 
-	// One LadybugDB instance per node (embedded single-writer store); the workers share it.
-	let db = Arc::new(Mutex::new(GraphDb::open(&db_path)?));
+	// One LadybugDB server owns the file; the shard workers are remote clients of it.
+	let server = LadybugServer::open(&db_path)?;
+	let handle = ServerHandle::start(server)?;
+	let db = Arc::new(Mutex::new(GraphDb::open(&handle.url)?));
 	{
 		let mut guard = db.lock().unwrap();
 		guard.create_schema()?;
-		guard.start_run(1, match algo {
-			Algorithm::KCore { k } => k,
-			Algorithm::Wcc => 0,
-		})?;
+		guard.start_run(
+			1,
+			match algo {
+				Algorithm::KCore { k } => k,
+				Algorithm::Wcc => 0,
+			},
+		)?;
 		seed_demo_graph(&mut guard)?;
 	}
-	println!("== ladybug-graph: {} over {}", describe(&algo), db_path.display());
-	println!("seeded demo graph across {NUM_SERVERS} shard servers (one shared store)");
+	println!(
+		"== ladybug-graph: {} over {}",
+		describe(&algo),
+		db_path.display()
+	);
+	println!(
+		"seeded demo graph across {NUM_SERVERS} shard servers (server-owned store at {})",
+		handle.url
+	);
 
 	let outcome = run_parallel(db, algo)?;
 

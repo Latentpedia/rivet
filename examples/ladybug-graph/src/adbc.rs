@@ -1,64 +1,47 @@
-//! ADBC (Arrow Database Connectivity) bridge over the universalDB LadybugDB graph driver.
+//! ADBC (Arrow Database Connectivity) bridge over the remote LadybugDB server.
 //!
-//! This is the inter-instance data plane for the platform. Distributed graph workers that run on
-//! different Rivet servers have no direct link to each other; their only channel is the shared
-//! LadybugDB graph store, and every read/write through that channel goes over the ADBC interface
-//! defined by [`adbc_core`], returning Arrow-native result sets.
+//! The four ADBC traits (`Driver`, `Database`, `Connection`, `Statement`) are implemented as a
+//! client of the columnar RPC protocol served by [`crate::ladybug_server`]: reads POST a
+//! `Query` request and stream back an Arrow IPC result, writes POST an `Update`. This is the
+//! inter-instance data plane for the platform. Distributed graph workers that run on different
+//! machines hold their own ADBC connection to the same server-owned store and exchange messages
+//! through it, exactly as they did with the old in-process store, but now with no shared file and
+//! no per-process write lock: the server is the single writer.
 //!
-//! Concretely, each worker opens an ADBC [`Connection`](adbc_core::sync::Connection) to the shared
-//! graph database and executes parameterized Cypher statements through
-//! [`Statement`](adbc_core::sync::Statement):
-//!
-//! - [`Statement::execute`] runs a read (its `MATCH` over the vertex/edge/message tables) and
-//!   returns an Arrow [`RecordBatchReader`](arrow_array::RecordBatchReader).
-//! - [`Statement::execute_update`] buffers a write (its `CREATE`/`SET`/`DELETE`) and commits it
-//!   atomically inside `BEGIN TRANSACTION .. COMMIT`.
-//!
-//! A worker therefore "sends a message" to a worker on another server by executing an update that
-//! inserts a row into the shared `Msg` table, and "receives" the messages aimed at its shard by
-//! executing a read over that table. Arrow result sets are what cross the ADBC boundary, keeping
-//! the message encode/decode on both sides of every instance typed instead of stringly-typed.
+//! The wire format keeps results columnar end to end. The server encodes rows as an Arrow IPC
+//! stream (`application/vnd.apache.arrow.stream`) and [`LadybugStmt::execute`] decodes
+//! `RecordBatch`es directly off that stream. Values only degrade to row-major form at the typed
+//! [`crate::graph`] layer when it asks for `Vec<Vec<Option<Value>>>`.
 //!
 //! The ADBC traits are implemented for "lifecycle + supported surface" parity, mirroring the
-//! philosophy of the underlying `LadybugDatabaseDriver`: the operations the platform uses are
-//! fully implemented, and the rest fail with an explicit `NotImplemented` error rather than
-//! silently misbehaving.
+//! philosophy of the underlying driver: the operations the platform uses are fully implemented,
+//! and the rest fail with an explicit `NotImplemented` error rather than silently misbehaving.
 
 use std::{
-	collections::HashSet,
-	path::PathBuf,
-	sync::Arc,
+	collections::{HashMap, HashSet},
+	io::Cursor,
 };
 
 use adbc_core::{
 	PartitionedResult,
 	error::{Error as AdbcError, Result as AdbcResult, Status},
-	options::{InfoCode, ObjectDepth, OptionConnection, OptionDatabase, OptionStatement, OptionValue},
+	options::{
+		InfoCode, ObjectDepth, OptionConnection, OptionDatabase, OptionStatement, OptionValue,
+	},
 	sync::{Connection as AdbcConnection, Database as AdbcDatabase, Driver, Optionable, Statement},
 };
 use arrow_array::{
-	Array, ArrayRef, RecordBatch, RecordBatchReader,
-	builder::{
-		BooleanBuilder, Float32Builder, Float64Builder, Int64Builder, StringBuilder,
-	},
+	Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+	RecordBatchReader, StringArray, UInt64Array,
 };
-use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
-use lbug::Connection;
-use lbug::Database as LbugDatabase;
-use lbug::SystemConfig;
-use lbug::Value;
+use arrow_ipc::reader::StreamReader;
+use arrow_schema::{ArrowError, Schema, SchemaRef};
+use lbug::{LogicalType, Value};
+
+use crate::protocol::{QueryKind, QueryRequest, UpdateResponse, value_to_wire};
 
 /// A convenience alias for `std::result::Result<T, arrow_schema::ArrowError>`.
 type ArrowResult<T> = std::result::Result<T, ArrowError>;
-
-/// Collects a lbug query result into `Option<Value>` cells (all rows present; nulls remain as
-/// `Some(Value::Null(_))`).
-fn collect_query(result: impl IntoIterator<Item = Vec<Value>>) -> Vec<Vec<Option<Value>>> {
-	result
-		.into_iter()
-		.map(|row| row.into_iter().map(Some).collect())
-		.collect()
-}
 
 fn not_implemented(msg: impl Into<String>) -> AdbcError {
 	AdbcError::with_message_and_status(msg.into(), Status::NotImplemented)
@@ -68,52 +51,25 @@ fn invalid(msg: impl Into<String>) -> AdbcError {
 	AdbcError::with_message_and_status(msg.into(), Status::InvalidArguments)
 }
 
-fn err_from_anyhow(e: &anyhow::Error, op: &str) -> AdbcError {
-	AdbcError::with_message_and_status(format!("{op} failed: {e:#}"), Status::InvalidData)
+/// Builds a shared blocking HTTP client off-thread. `reqwest::blocking` creates an internal tokio
+/// runtime, and dropping that runtime inside an async runtime context panics; the driver is opened
+/// from async actor handlers, so construct it on a plain thread instead.
+fn blocking_client() -> reqwest::blocking::Client {
+	std::thread::spawn(reqwest::blocking::Client::new)
+		.join()
+		.expect("spawn reqwest blocking client thread")
 }
 
-fn open_database(path: Option<PathBuf>, in_memory: bool) -> AdbcResult<Arc<LbugDatabase>> {
-	let config = SystemConfig::default();
-	if in_memory {
-		return LbugDatabase::in_memory(config)
-			.map(Arc::new)
-			.map_err(|e| {
-				AdbcError::with_message_and_status(format!("open in-memory ladybug: {e}"), Status::InvalidData)
-			});
-	}
-	let path = path.ok_or_else(|| {
-		invalid("database has no path and is not in-memory; pass Uri in new_database_with_opts")
-	})?;
-	if let Some(parent) = path.parent() {
-		let _ = std::fs::create_dir_all(parent);
-	}
-	LbugDatabase::new(path, config)
-		.map(Arc::new)
-		.map_err(|e| AdbcError::with_message_and_status(format!("open ladybug database: {e}"), Status::InvalidData))
-}
-
-/// The ADBC driver for LadybugDB. Configured with either a file path (durable) or in-memory.
+/// The ADBC driver for the remote LadybugDB server, configured with the server base URL.
 #[derive(Clone, Debug)]
 pub struct LadybugDriver {
-	path: Option<PathBuf>,
-	in_memory: bool,
+	url: String,
 }
 
 impl LadybugDriver {
-	/// A durable driver rooted at `path` (the database prefix, parent dir created on open).
-	pub fn new(path: impl Into<PathBuf>) -> Self {
-		LadybugDriver {
-			path: Some(path.into()),
-			in_memory: false,
-		}
-	}
-
-	/// A throwaway in-memory driver; data is lost when the returned database is dropped.
-	pub fn in_memory() -> Self {
-		LadybugDriver {
-			path: None,
-			in_memory: true,
-		}
+	/// A driver rooted at a LadybugDB server URL (for example `http://127.0.0.1:8123`).
+	pub fn new(url: impl Into<String>) -> Self {
+		LadybugDriver { url: url.into() }
 	}
 }
 
@@ -122,8 +78,8 @@ impl Driver for LadybugDriver {
 
 	fn new_database(&mut self) -> AdbcResult<Self::DatabaseType> {
 		Ok(LadybugDb {
-			db: open_database(self.path.clone(), self.in_memory)?,
-			write_lock: Arc::new(std::sync::Mutex::new(())),
+			client: blocking_client(),
+			url: self.url.clone(),
 		})
 	}
 
@@ -131,31 +87,31 @@ impl Driver for LadybugDriver {
 		&mut self,
 		opts: impl IntoIterator<Item = (OptionDatabase, OptionValue)>,
 	) -> AdbcResult<Self::DatabaseType> {
+		let mut url = self.url.clone();
 		for (key, value) in opts {
 			if key == OptionDatabase::Uri {
-				let uri = match value {
+				url = match value {
 					OptionValue::String(s) => s,
 					other => {
 						return Err(invalid(format!(
 							"expected a string Uri for the ladybug driver, got {other:?}"
-						)))
+						)));
 					}
 				};
-				return Ok(LadybugDb {
-					db: open_database(Some(PathBuf::from(uri)), false)?,
-					write_lock: Arc::new(std::sync::Mutex::new(())),
-				});
 			}
 		}
-		self.new_database()
+		Ok(LadybugDb {
+			client: blocking_client(),
+			url,
+		})
 	}
 }
 
-/// An ADBC database: owns the [`lbug::Database`] so all connections hit one store.
+/// An ADBC database: a shared HTTP client plus the server base URL, so every connection and
+/// statement reuses the same pooled TCP connection to the server-owned store.
 pub struct LadybugDb {
-	db: Arc<LbugDatabase>,
-	// Serializes write queries, because lbug allows only one write in flight per process.
-	write_lock: Arc<std::sync::Mutex<()>>,
+	client: reqwest::blocking::Client,
+	url: String,
 }
 
 impl AdbcDatabase for LadybugDb {
@@ -163,8 +119,8 @@ impl AdbcDatabase for LadybugDb {
 
 	fn new_connection(&self) -> AdbcResult<Self::ConnectionType> {
 		Ok(LadybugConn {
-			db: self.db.clone(),
-			write_lock: self.write_lock.clone(),
+			client: self.client.clone(),
+			url: self.url.clone(),
 		})
 	}
 
@@ -177,10 +133,9 @@ impl AdbcDatabase for LadybugDb {
 }
 
 impl LadybugDb {
-	/// Runs a Cypher read through the ADBC [`Statement::execute`] path. The statement executes the
-	/// query (Arrow result sets) and the results are decoded back to `Option<Value>` cells for
-	/// typed consumption in [`crate::graph`]. This is the Arrow round trip that crosses the ADBC
-	/// boundary, which is why the algorithm's inter-instance reads flow through `adbc_core`.
+	/// Runs a Cypher read through the ADBC [`Statement::execute`] path. The server streams an
+	/// Arrow IPC result which is decoded back to `Option<Value>` cells for typed consumption in
+	/// [`crate::graph`].
 	pub fn query(
 		&mut self,
 		cypher: &str,
@@ -192,14 +147,7 @@ impl LadybugDb {
 		for (k, v) in params {
 			stmt.params.push((k.to_string(), v.clone()));
 		}
-		let reader = stmt.execute()?;
-		let mut rows = Vec::new();
-		for batch in reader {
-			let batch = batch
-				.map_err(|e| AdbcError::with_message_and_status(e.to_string(), Status::InvalidData))?;
-			rows.extend(batch_to_rows(&batch));
-		}
-		Ok(rows)
+		stmt.read()
 	}
 
 	/// Runs a Cypher write through the ADBC [`Statement::execute_update`] path.
@@ -210,7 +158,7 @@ impl LadybugDb {
 		stmt.execute_update()
 	}
 
-	/// Runs a read and returns a single scalar `Int64` value (e.g. a `COUNT(*)`).
+	/// Runs a read and returns a single scalar `Int64` value (for example a `COUNT(*)`).
 	pub fn scalar_i64(&mut self, cypher: &str) -> AdbcResult<Option<i64>> {
 		let rows = self.query(cypher, &[])?;
 		let row = rows.first().and_then(|r| r.first().cloned().flatten());
@@ -220,7 +168,6 @@ impl LadybugDb {
 		})
 	}
 }
-
 
 impl Optionable for LadybugDb {
 	type Option = OptionDatabase;
@@ -242,10 +189,10 @@ impl Optionable for LadybugDb {
 	}
 }
 
-/// An ADBC connection: a thin handle on the shared ladybug graph driver.
+/// An ADBC connection: a thin handle sharing the database's HTTP client and server URL.
 pub struct LadybugConn {
-	db: Arc<LbugDatabase>,
-	write_lock: Arc<std::sync::Mutex<()>>,
+	client: reqwest::blocking::Client,
+	url: String,
 }
 
 impl AdbcConnection for LadybugConn {
@@ -253,8 +200,8 @@ impl AdbcConnection for LadybugConn {
 
 	fn new_statement(&mut self) -> AdbcResult<Self::StatementType> {
 		Ok(LadybugStmt {
-			db: self.db.clone(),
-			write_lock: self.write_lock.clone(),
+			client: self.client.clone(),
+			url: self.url.clone(),
 			query: None,
 			params: Vec::new(),
 		})
@@ -297,7 +244,9 @@ impl AdbcConnection for LadybugConn {
 	}
 
 	fn get_statistic_names(&self) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
-		Err(not_implemented("get_statistic_names for the ladybug driver"))
+		Err(not_implemented(
+			"get_statistic_names for the ladybug driver",
+		))
 	}
 
 	fn get_statistics(
@@ -347,60 +296,81 @@ impl Optionable for LadybugConn {
 }
 
 /// An ADBC statement. `set_sql_query` stores the Cypher, `bind` binds named parameters, and
-/// [`execute`] / [`execute_update`] run the query against the shared graph.
+/// [`execute`](Statement::execute) / [`execute_update`](Statement::execute_update) run the query
+/// against the remote server.
 pub struct LadybugStmt {
-	db: Arc<LbugDatabase>,
-	write_lock: Arc<std::sync::Mutex<()>>,
+	client: reqwest::blocking::Client,
+	url: String,
 	query: Option<String>,
 	params: Vec<(String, Value)>,
 }
 
 impl LadybugStmt {
-	fn read(&self) -> AdbcResult<(Vec<String>, Vec<Vec<Option<Value>>>)> {
+	/// POSTs the statement to the server and returns the decoded response.
+	fn send(&self, kind: QueryKind) -> AdbcResult<reqwest::blocking::Response> {
 		let query = self
 			.query
 			.as_deref()
 			.ok_or_else(|| invalid("no SQL query set on ladybug statement"))?;
-		let params: Vec<(&str, Value)> = self
+		let params: HashMap<String, crate::protocol::WireValue> = self
 			.params
 			.iter()
-			.map(|(k, v)| (k.as_str(), v.clone()))
+			.map(|(k, v)| (k.clone(), value_to_wire(v)))
 			.collect();
-		let conn = Connection::new(&self.db).map_err(|e| {
-			AdbcError::with_message_and_status(format!("ladybug connect: {e}"), Status::InvalidData)
-		})?;
-		let (columns, result) = if params.is_empty() {
-			let result = conn.query(query).map_err(|e| {
-				AdbcError::with_message_and_status(format!("ladybug query failed: {e}"), Status::InvalidData)
-			})?;
-			(result.get_column_names(), result)
-		} else {
-			let mut stmt = conn.prepare(query).map_err(|e| {
-				AdbcError::with_message_and_status(format!("ladybug prepare failed: {e}"), Status::InvalidData)
-			})?;
-			let result = conn.execute(&mut stmt, params).map_err(|e| {
-				AdbcError::with_message_and_status(format!("ladybug execute failed: {e}"), Status::InvalidData)
-			})?;
-			(result.get_column_names(), result)
+		let request = QueryRequest {
+			kind,
+			cypher: query.to_string(),
+			params,
 		};
-		Ok((columns, collect_query(result)))
+		let response = self
+			.client
+			.post(format!("{}/rpc", self.url.trim_end_matches('/')))
+			.json(&request)
+			.send()
+			.map_err(|e| {
+				AdbcError::with_message_and_status(
+					format!("ladybug rpc failed: {e}"),
+					Status::InvalidData,
+				)
+			})?;
+		let status = response.status();
+		if !status.is_success() {
+			let body: serde_json::Value = response.json().unwrap_or_else(|_| serde_json::json!({}));
+			let message = body
+				.get("error")
+				.and_then(|e| e.as_str())
+				.unwrap_or("unknown server error");
+			return Err(AdbcError::with_message_and_status(
+				format!("ladybug server {status}: {message}"),
+				Status::InvalidData,
+			));
+		}
+		Ok(response)
 	}
 
-	fn write(&self) -> AdbcResult<Option<i64>> {
-		let query = self
-			.query
-			.as_deref()
-			.ok_or_else(|| invalid("no SQL query set on ladybug statement"))?;
-		let _guard = self.write_lock.lock().map_err(|_| {
-			AdbcError::with_message_and_status("ladybug write lock poisoned", Status::Internal)
+	/// Runs the read and decodes the Arrow IPC stream into row-major `Option<Value>` cells.
+	fn read(&self) -> AdbcResult<Vec<Vec<Option<Value>>>> {
+		let response = self.send(QueryKind::Query)?;
+		let bytes = response.bytes().map_err(|e| {
+			AdbcError::with_message_and_status(
+				format!("read ladybug result body: {e}"),
+				Status::InvalidData,
+			)
 		})?;
-		let conn = Connection::new(&self.db).map_err(|e| {
-			AdbcError::with_message_and_status(format!("ladybug connect: {e}"), Status::InvalidData)
+		let stream = StreamReader::try_new(Cursor::new(bytes.to_vec()), None).map_err(|e| {
+			AdbcError::with_message_and_status(
+				format!("decode arrow stream: {e}"),
+				Status::InvalidData,
+			)
 		})?;
-		conn.query(query).map_err(|e| {
-			AdbcError::with_message_and_status(format!("ladybug write failed: {e}"), Status::InvalidData)
-		})?;
-		Ok(None)
+		let mut rows = Vec::new();
+		for batch in stream {
+			let batch = batch.map_err(|e| {
+				AdbcError::with_message_and_status(e.to_string(), Status::InvalidData)
+			})?;
+			rows.extend(batch_to_rows(&batch));
+		}
+		Ok(rows)
 	}
 }
 
@@ -423,31 +393,53 @@ impl Statement for LadybugStmt {
 		Ok(())
 	}
 
-	fn bind_stream(
-		&mut self,
-		_reader: Box<dyn RecordBatchReader + Send>,
-	) -> AdbcResult<()> {
+	fn bind_stream(&mut self, _reader: Box<dyn RecordBatchReader + Send>) -> AdbcResult<()> {
 		Err(not_implemented("bind_stream for the ladybug driver"))
 	}
 
 	fn execute(&mut self) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
-		let (columns, rows) = self.read()?;
-		let batch = rows_to_batch(columns, &rows).map_err(|e| err_from_anyhow(&e, "arrow encode"))?;
-		let schema = batch.schema();
-		Ok(Box::new(InMemReader {
-			schema,
-			batch: Some(batch),
-		}))
+		let response = self.send(QueryKind::Query)?;
+		let bytes = response.bytes().map_err(|e| {
+			AdbcError::with_message_and_status(
+				format!("read ladybug result body: {e}"),
+				Status::InvalidData,
+			)
+		})?;
+		let stream = StreamReader::try_new(Cursor::new(bytes.to_vec()), None).map_err(|e| {
+			AdbcError::with_message_and_status(
+				format!("decode arrow stream: {e}"),
+				Status::InvalidData,
+			)
+		})?;
+		Ok(Box::new(RemoteStream { stream }))
 	}
 
 	fn execute_update(&mut self) -> AdbcResult<Option<i64>> {
-		self.write()
+		let response = self.send(QueryKind::Update)?;
+		let update: UpdateResponse = response.json().map_err(|e| {
+			AdbcError::with_message_and_status(
+				format!("decode update ack: {e}"),
+				Status::InvalidData,
+			)
+		})?;
+		Ok(update.affected_rows)
 	}
 
 	fn execute_schema(&mut self) -> AdbcResult<Schema> {
-		let (columns, rows) = self.read()?;
-		let batch = rows_to_batch(columns, &rows).map_err(|e| err_from_anyhow(&e, "arrow encode"))?;
-		Ok(batch.schema().as_ref().clone())
+		let response = self.send(QueryKind::Query)?;
+		let bytes = response.bytes().map_err(|e| {
+			AdbcError::with_message_and_status(
+				format!("read ladybug result body: {e}"),
+				Status::InvalidData,
+			)
+		})?;
+		let stream = StreamReader::try_new(Cursor::new(bytes.to_vec()), None).map_err(|e| {
+			AdbcError::with_message_and_status(
+				format!("decode arrow stream: {e}"),
+				Status::InvalidData,
+			)
+		})?;
+		Ok(stream.schema().as_ref().clone())
 	}
 
 	fn execute_partitions(&mut self) -> AdbcResult<PartitionedResult> {
@@ -496,8 +488,27 @@ impl Optionable for LadybugStmt {
 	}
 }
 
+/// Streams the `RecordBatch`es of a server response body directly off the Arrow IPC wire.
+struct RemoteStream {
+	stream: StreamReader<Cursor<Vec<u8>>>,
+}
+
+impl Iterator for RemoteStream {
+	type Item = ArrowResult<RecordBatch>;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		self.stream.next()
+	}
+}
+
+impl RecordBatchReader for RemoteStream {
+	fn schema(&self) -> SchemaRef {
+		self.stream.schema()
+	}
+}
+
 // ---------------------------------------------------------------------------
-// Arrow encoding
+// Arrow decoding
 // ---------------------------------------------------------------------------
 
 /// Converts an Arrow batch back into `Option<Value>` cells, the typed form `graph`/`algorithm`
@@ -524,181 +535,32 @@ fn batch_to_rows(batch: &RecordBatch) -> Vec<Vec<Option<Value>>> {
 /// Reads a single scalar `lbug::Value` out of an Arrow parameter array at `row`.
 fn value_at(array: &dyn Array, row: usize) -> Value {
 	if array.is_null(row) {
-		return Value::Null(lbug::LogicalType::Any);
+		return Value::Null(LogicalType::Any);
 	}
-	if let Some(a) = array.as_any().downcast_ref::<arrow_array::BooleanArray>() {
-		return if a.value(row) { Value::Bool(true) } else { Value::Bool(false) };
+	if let Some(a) = array.as_any().downcast_ref::<BooleanArray>() {
+		return if a.value(row) {
+			Value::Bool(true)
+		} else {
+			Value::Bool(false)
+		};
 	}
-	if let Some(a) = array.as_any().downcast_ref::<arrow_array::Int64Array>() {
+	if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
 		return Value::Int64(a.value(row));
 	}
-	if let Some(a) = array.as_any().downcast_ref::<arrow_array::Int32Array>() {
+	if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
 		return Value::Int32(a.value(row));
 	}
-	if let Some(a) = array.as_any().downcast_ref::<arrow_array::UInt64Array>() {
+	if let Some(a) = array.as_any().downcast_ref::<UInt64Array>() {
 		return Value::UInt64(a.value(row));
 	}
-	if let Some(a) = array.as_any().downcast_ref::<arrow_array::Float32Array>() {
+	if let Some(a) = array.as_any().downcast_ref::<Float32Array>() {
 		return Value::Float(a.value(row));
 	}
-	if let Some(a) = array.as_any().downcast_ref::<arrow_array::Float64Array>() {
+	if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
 		return Value::Double(a.value(row));
 	}
-	if let Some(a) = array.as_any().downcast_ref::<arrow_array::StringArray>() {
+	if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
 		return Value::String(a.value(row).to_string());
 	}
-	Value::Null(lbug::LogicalType::Any)
-}
-
-/// Picks an Arrow [`DataType`] for a ladybug scalar value. Integers collapse to `Int64`, floats
-/// keep their width, strings map to `Utf8`, booleans to `Boolean`. Anything else falls back to
-/// `Utf8` via the value's `Display` so columnar projection still works for ad-hoc queries.
-fn datatype_of(value: &Value) -> DataType {
-	match value {
-		Value::Bool(_) => DataType::Boolean,
-		Value::Int64(_)
-		| Value::Int32(_)
-		| Value::Int16(_)
-		| Value::Int8(_)
-		| Value::UInt64(_)
-		| Value::UInt32(_)
-		| Value::UInt16(_)
-		| Value::UInt8(_)
-		| Value::Int128(_) => DataType::Int64,
-		Value::Float(_) => DataType::Float32,
-		Value::Double(_) => DataType::Float64,
-		Value::String(_) | Value::Json(_) => DataType::Utf8,
-		Value::Null(_) => DataType::Utf8,
-		_ => DataType::Utf8,
-	}
-}
-
-fn value_display(value: &Value) -> String {
-	match value {
-		Value::Null(_) => String::new(),
-		v => format!("{v}"),
-	}
-}
-
-fn opt_i64(value: &Value) -> Option<i64> {
-	match value {
-		Value::Int64(v) => Some(*v),
-		Value::Int32(v) => Some(i64::from(*v)),
-		Value::Int16(v) => Some(i64::from(*v)),
-		Value::Int8(v) => Some(i64::from(*v)),
-		Value::UInt64(v) => i64::try_from(*v).ok(),
-		Value::UInt32(v) => Some(i64::from(*v)),
-		Value::UInt16(v) => Some(i64::from(*v)),
-		Value::UInt8(v) => Some(i64::from(*v)),
-		Value::Int128(v) => i64::try_from(*v).ok(),
-		Value::Null(_) => None,
-		_ => None,
-	}
-}
-
-/// Builds an Arrow [`RecordBatch`] from the rows of a ladybug query.
-fn rows_to_batch(columns: Vec<String>, rows: &[Vec<Option<Value>>]) -> anyhow::Result<RecordBatch> {
-	let ncols = if columns.is_empty() {
-		rows.first().map(|r| r.len()).unwrap_or(0)
-	} else {
-		columns.len()
-	};
-
-	let mut fields = Vec::with_capacity(ncols);
-	let mut arrays: Vec<ArrayRef> = Vec::with_capacity(ncols);
-
-	for c in 0..ncols {
-		let name = columns
-			.get(c)
-			.cloned()
-			.unwrap_or_else(|| format!("col{c}"));
-		let mut col_values: Vec<Option<Value>> = Vec::with_capacity(rows.len());
-		for row in rows {
-			col_values.push(row.get(c).cloned().flatten());
-		}
-		let dt = col_values
-			.iter()
-			.find_map(|v| v.as_ref())
-			.map(datatype_of)
-			.unwrap_or(DataType::Utf8);
-
-		let array: ArrayRef = match dt {
-			DataType::Boolean => {
-				let mut b = BooleanBuilder::new();
-				for v in &col_values {
-					match v {
-						Some(Value::Bool(x)) => b.append_value(*x),
-						_ => b.append_null(),
-					}
-				}
-				Arc::new(b.finish())
-			}
-			DataType::Float32 => {
-				let mut b = Float32Builder::new();
-				for v in &col_values {
-					match v {
-						Some(Value::Float(x)) => b.append_value(*x),
-						_ => b.append_null(),
-					}
-				}
-				Arc::new(b.finish())
-			}
-			DataType::Float64 => {
-				let mut b = Float64Builder::new();
-				for v in &col_values {
-					match v {
-						Some(Value::Double(x)) => b.append_value(*x),
-						_ => b.append_null(),
-					}
-				}
-				Arc::new(b.finish())
-			}
-			DataType::Int64 => {
-				let mut b = Int64Builder::new();
-				for v in &col_values {
-					match v.as_ref().and_then(opt_i64) {
-						Some(x) => b.append_value(x),
-						None => b.append_null(),
-					}
-				}
-				Arc::new(b.finish())
-			}
-			_ => {
-				let mut b = StringBuilder::new();
-				for v in &col_values {
-					match v {
-						Some(v2) if !matches!(v2, Value::Null(_)) => b.append_value(value_display(v2)),
-						_ => b.append_null(),
-					}
-				}
-				Arc::new(b.finish())
-			}
-		};
-
-		fields.push(Field::new(name, dt.clone(), true));
-		arrays.push(array);
-	}
-
-	let schema = Arc::new(Schema::new(fields));
-	Ok(RecordBatch::try_new(schema, arrays)?)
-}
-
-/// An in-memory Arrow reader that yields a single pre-built batch (used for a whole query result).
-struct InMemReader {
-	schema: SchemaRef,
-	batch: Option<RecordBatch>,
-}
-
-impl Iterator for InMemReader {
-	type Item = ArrowResult<RecordBatch>;
-
-	fn next(&mut self) -> Option<Self::Item> {
-		self.batch.take().map(Ok)
-	}
-}
-
-impl RecordBatchReader for InMemReader {
-	fn schema(&self) -> SchemaRef {
-		self.schema.clone()
-	}
+	Value::Null(LogicalType::Any)
 }

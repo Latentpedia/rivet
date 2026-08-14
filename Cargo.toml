@@ -250,6 +250,10 @@ members = [
     version = "59"
     default-features = false
 
+    [workspace.dependencies.arrow-ipc]
+    version = "59"
+    default-features = false
+
     # lbug (ladybug) bundles LZ4 and ZSTD into liblbug.a and links it with
     # +whole-archive, so enabling rocksdb's lz4/zstd features would link two
     # copies of the same symbols. Keep snappy/zlib/bzip2 (lbug's copies are

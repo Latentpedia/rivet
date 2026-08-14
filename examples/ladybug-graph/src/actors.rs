@@ -8,28 +8,30 @@
 //!
 //! This is the `rivet` half of the platform: Rivet owns actor lifecycle and the cross-process
 //! control plane (the `Coordinator` invoking `VertexWorker`s across servers), while `adbc_core`
-//! owns the data plane (the vertices, edges, messages, and results persisted in LadybugDB).
+//! owns the data plane (the vertices, edges, messages, and results persisted in LadybugDB). The
+//! store itself lives in a dedicated `ladybug-server` process; every worker and coordinator is a
+//! **remote client** that connects to it via the columnar protocol, so N separate processes and
+//! machines can share one store without touching a shared file.
 //!
 //! Configuration comes from the environment so the same binary can be a worker or a coordinator
 //! on any server:
 //!
-//! - `LADYBUG_DB` — shared graph database path (all servers point at the same file).
+//! - `LADYBUG_DB` — LadybugDB server URL (for example `http://127.0.0.1:8123`).
 //! - `SERVER_ID` — this process's shard index (used by a worker).
 //! - `NUM_SERVERS` — total shard count (used by a coordinator).
 //! - `GRAPH_RUN_ID`, `GRAPH_K`, `GRAPH_ALGO` — coordinator run parameters.
 
 use std::{
+	collections::HashMap,
 	future::Future,
 	pin::Pin,
-	sync::{Arc, Mutex},
+	sync::{Arc, LazyLock, Mutex},
 };
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use rivetkit::{
-	Action, Actor, Ctx, Handles, Registry,
-	action,
-	client::GetOrCreateOptions,
+	Action, Actor, Ctx, Handles, KeepAwakeRegion, Registry, action, client::GetOrCreateOptions,
 	typed_client::TypedClientExt,
 };
 use serde::{Deserialize, Serialize};
@@ -50,14 +52,15 @@ fn algo(algo_idx: i64, k: i64) -> Result<Algorithm> {
 	}
 }
 
-fn db_path_from_env() -> Result<String> {
-	std::env::var("LADYBUG_DB").context("LADYBUG_DB must be set to the shared graph database path")
+fn db_url_from_env() -> Result<String> {
+	std::env::var("LADYBUG_DB").context(
+		"LADYBUG_DB must be set to the LadybugDB server URL (for example http://127.0.0.1:8123)",
+	)
 }
 
-/// The store is an embedded single-instance database, so a process must open it exactly once and
-/// share the handle across every worker/coordinator actor in that process. Multi-process access to
-/// the same file is not supported by the embedded backend (true cross-node distribution would run
-/// LadybugDB as a remote server and connect workers over its URL).
+/// A process opens one remote client connection and shares it across every worker/coordinator
+/// actor in that process (the client is a thin pooled HTTP handle, so sharing is cheap). The
+/// server process is the single writer; clients never own the file.
 static SHARED_DB: Mutex<Option<Arc<Mutex<crate::graph::GraphDb>>>> = Mutex::new(None);
 
 /// Returns the process-wide shared graph store, opening it from `LADYBUG_DB` on first use.
@@ -66,11 +69,18 @@ fn shared_db() -> Result<Arc<Mutex<crate::graph::GraphDb>>> {
 	if let Some(db) = &*guard {
 		return Ok(db.clone());
 	}
-	let path = db_path_from_env()?;
-	let db = Arc::new(Mutex::new(crate::graph::GraphDb::open(&path)?));
+	let url = db_url_from_env()?;
+	let db = Arc::new(Mutex::new(crate::graph::GraphDb::open(&url)?));
 	*guard = Some(db.clone());
 	Ok(db)
 }
+
+/// Keeps the worker actors resident across supersteps for the lifetime of the process. Without it,
+/// an idle worker hibernates after each superstep and the engine pays a full actor cold-start to
+/// resume it for the next round, which is far slower than the algorithm's message passing itself.
+/// Workers stay warm (one keep-awake region per shard) so the barrier loop runs hot.
+static KEEP_AWAKE: LazyLock<Mutex<HashMap<i64, KeepAwakeRegion>>> =
+	LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // ---------------------------------------------------------------------------
 // VertexWorker
@@ -147,10 +157,22 @@ impl Handles<RunSuperstep> for VertexWorker {
 						.unwrap_or(0)
 				});
 			let algo = algo(action.algo_idx, action.k)?;
+			// Hold this worker awake for the rest of the run so it does not hibernate between
+			// superstep actions (a cold-start resume between every round would dominate the cost).
+			KEEP_AWAKE
+				.lock()
+				.unwrap()
+				.entry(server)
+				.or_insert_with(|| ctx.keep_awake_region());
 			let db = shared_db()?;
 			let mut db = db.lock().unwrap();
 			let produced = crate::algorithm::run_superstep(&mut db, server, action.round, algo)?;
-			info!(server, round = action.round, produced, "vertex worker superstep complete");
+			info!(
+				server,
+				round = action.round,
+				produced,
+				"vertex worker superstep complete"
+			);
 			Ok(produced)
 		})
 	}
@@ -220,7 +242,12 @@ impl Handles<RunAlgorithm> for Coordinator {
 
 			// The control plane: reach every worker actor across the servers via Rivet.
 			let client = ctx.client()?;
-			info!(run_id = action.run_id, num_servers, ?algo, "starting distributed algorithm run");
+			info!(
+				run_id = action.run_id,
+				num_servers,
+				?algo,
+				"starting distributed algorithm run"
+			);
 			let mut produced = i64::MAX;
 			let mut round = 0i64;
 			let mut rounds = 0i64;
@@ -281,7 +308,12 @@ impl Handles<RunAlgorithm> for Coordinator {
 					}
 				}
 			}
-			info!(rounds, vertices = total, active, "algorithm result persisted");
+			info!(
+				rounds,
+				vertices = total,
+				active,
+				"algorithm result persisted"
+			);
 			Ok(CoordinatorResult {
 				rounds,
 				vertices: total,

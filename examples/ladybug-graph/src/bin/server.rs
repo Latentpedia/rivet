@@ -8,8 +8,8 @@
 //! Subcommands:
 //!
 //! - `serve` (default) — host the worker + coordinator actors. Once the actors are reachable, a
-//!   client task triggers `runAlgorithm` (disable with `GRAPH_AUTO_RUN=0`) so the computation runs
-//!   and its progress is visible in the logs.
+//!   client task triggers `runAlgorithm` (disable with `GRAPH_AUTO_RUN=0`) so the computation runs,
+//!   its progress is visible in the logs, and the process exits once the run completes.
 //! - `seed <url> <k>` — create the schema and seed the demo graph once (before starting servers),
 //!   sent to the ladybug server at `<url>` over the columnar protocol.
 
@@ -113,15 +113,31 @@ async fn try_run_algorithm(
 	Ok(result)
 }
 
-/// Hosts the platform actors on this server process until interrupted.
+/// Hosts the platform actors, exiting once the auto-triggered algorithm run finishes so the
+/// demo terminates on its own (the coordinator persists the result before replying). With
+/// `GRAPH_AUTO_RUN=0` (no trigger) it serves until interrupted.
 async fn serve() -> Result<()> {
 	let auto_run = std::env::var("GRAPH_AUTO_RUN")
 		.map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
 		.unwrap_or(true);
+	let (done_tx, done_rx) = tokio::sync::oneshot::channel();
 	if auto_run {
-		tokio::spawn(async move { trigger_algorithm().await });
+		tokio::spawn(async move {
+			trigger_algorithm().await;
+			let _ = done_tx.send(());
+		});
 	}
-	example_ladybug_graph::actors::registry().start().await
+
+	// Host the actors, but return as soon as the run completes so the process exits and the
+	// demo script can tear everything down.
+	let mut serve = Box::pin(example_ladybug_graph::actors::registry().start());
+	tokio::select! {
+		// Surface an early serve failure instead of waiting for the run.
+		result = &mut serve => result?,
+		_ = done_rx => {}
+	}
+	info!("algorithm run finished; shutting down host");
+	Ok(())
 }
 
 fn seed(url: &str, k: i64) -> Result<()> {

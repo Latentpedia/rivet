@@ -86,9 +86,15 @@ holds both):
   binaries.  `run-ladybug-demo.sh rivet` runs it automatically; `run-ladybug-3shard-demo.sh` skips it
   and uses the prebuilt release binaries.
 - **Run phase** — frees the demo port of any stale server, starts a fresh `ladybug-server` on a
-  clean store, seeds it, and hosts the worker + coordinator actors.  On exit (including Ctrl-C) it
-  tears down the ladybug-server, the host `server`, and the rivet engine, and resets the engine
-  state (`~/.rivetkit/var/engine/db`), so the next run starts clean.
+  clean store, seeds it, and hosts the worker + coordinator actors.  The host exits automatically
+  once the algorithm run completes (Ctrl-C still works to stop early), and on exit it tears down
+  the ladybug-server, the host `server`, and the rivet engine, and resets the engine state
+  (`~/.rivetkit/var/engine/db`), so the next run starts clean.
+
+Results and progress are visible on stderr: per-vertex `vertex result` lines show what each shard
+computed (`server` is the shard, `tag` is `IN`/`OUT` of the k-core).  The persisted graph lives in
+the store file passed to the demo (`/tmp/foo.db` for the 3-shard demo; recreated on the next run),
+and engine logs live in `~/.rivetkit/var/logs/rivet-engine/`.
 
 ```sh
 # Standalone demo (no engine): spins up an in-process ladybug-server on an ephemeral port and

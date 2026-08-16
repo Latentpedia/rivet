@@ -18,7 +18,8 @@ source "$(dirname "$0")/ladybug-demo-lib.sh"
 ladybug_install_cleanup
 ladybug_start_store "$db" "$url"
 ./target/release/server seed "$url" 2
-echo "hosting worker + coordinator actors (GRAPH_AUTO_RUN defaults to on)..."
+echo "hosting worker + coordinator actors (auto-triggers runAlgorithm and exits when done)..."
 LADYBUG_DB=$url NUM_SERVERS=3 GRAPH_K=2 GRAPH_ALGO=1 GRAPH_RUN_ID=1 ./target/release/server &
 LADYBUG_HOST_PID=$!
 wait "$LADYBUG_HOST_PID"
+echo "demo finished; results persisted to the graph store at $db (see the superstep logs above; the store is recreated on the next run)" >&2

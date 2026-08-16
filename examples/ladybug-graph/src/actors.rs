@@ -306,6 +306,15 @@ impl Handles<RunAlgorithm> for Coordinator {
 					if v.active {
 						active += 1;
 					}
+					let tag = if v.active { "IN" } else { "OUT" };
+					info!(
+						id = v.id,
+						server = v.server,
+						degree = v.degree,
+						core = v.core,
+						tag,
+						"vertex result"
+					);
 				}
 			}
 			info!(

@@ -34,8 +34,15 @@ case "$mode" in
   threads)
     algo="${2:-kcore}"
     shift 2 || true
-    # --bin pins the demo binary (the package also ships the rivet `server` binary).
-    cargo run --release -p example-ladybug-graph --bin example-ladybug-graph -- "$algo" "$@"
+    # Invoke the compiled binary directly: a `cargo run` here recompiles the whole dependency
+    # chain on every demo (feature unification churns against the rivet-mode build).  The compile
+    # phase (rivet mode / ladybug_build) produces this binary.
+    if [ ! -x ./target/release/example-ladybug-graph ]; then
+      echo "standalone demo binary not found; running the compile phase once..." >&2
+      source "$(dirname "$0")/ladybug-demo-lib.sh"
+      ladybug_build
+    fi
+    ./target/release/example-ladybug-graph "$algo" "$@"
     ;;
   rivet)
     algo="${2:-kcore}"
@@ -68,10 +75,11 @@ case "$mode" in
     ladybug_start_store "$db" "$url"
     echo "seeding graph through the columnar protocol at $url (k=$k)..." >&2
     ./target/release/server seed "$url" "$k"
-    echo "hosting worker + coordinator actors (auto-triggers runAlgorithm; Ctrl-C to stop)..." >&2
+    echo "hosting worker + coordinator actors (auto-triggers runAlgorithm and exits when done)..." >&2
     LADYBUG_DB="$url" NUM_SERVERS=3 GRAPH_K="$k" GRAPH_ALGO="$graph_algo" GRAPH_RUN_ID=1 \
       ./target/release/server &
     LADYBUG_HOST_PID=$!
     wait "$LADYBUG_HOST_PID"
+    echo "demo finished; results persisted to the graph store at $db (see the superstep logs above)" >&2
     ;;
 esac

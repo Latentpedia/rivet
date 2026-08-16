@@ -78,15 +78,29 @@ engine requires. `src/protocol.rs` holds the wire contract shared by both sides.
 
 ## Run
 
+The demos are split into a shared **compile phase** and a **run phase** (`scripts/ladybug-demo-lib.sh`
+holds both):
+
+- **Compile phase** (`ladybug_build`) — `cargo build --release -p rivet-engine -p example-ladybug-graph`,
+  producing the `rivet-engine`, `ladybug-server`, `server`, and standalone `example-ladybug-graph`
+  binaries.  `run-ladybug-demo.sh rivet` runs it automatically; `run-ladybug-3shard-demo.sh` skips it
+  and uses the prebuilt release binaries.
+- **Run phase** — frees the demo port of any stale server, starts a fresh `ladybug-server` on a
+  clean store, seeds it, and hosts the worker + coordinator actors.  On exit (including Ctrl-C) it
+  tears down the ladybug-server, the host `server`, and the rivet engine, and resets the engine
+  state (`~/.rivetkit/var/engine/db`), so the next run starts clean.
+
 ```sh
 # Standalone demo (no engine): spins up an in-process ladybug-server on an ephemeral port and
 # runs the algorithm over the remote columnar protocol.
 scripts/run-ladybug-demo.sh kcore 2      # k-core with k=2 (default)
 scripts/run-ladybug-demo.sh wcc
 
-# Rivet actor deployment: start the ladybug server, seed, then host the actors as remote clients.
-./target/release/ladybug-server --db /tmp/cluster.lbdb --listen 127.0.0.1:8123 &
-LADYBUG_DB=http://127.0.0.1:8123 NUM_SERVERS=3 ./target/release/server
+# Rivet actor deployment: compile phase + seed a fresh store + host the actors.
+scripts/run-ladybug-demo.sh rivet kcore  # k-core with k=2 (default), or: rivet wcc
+
+# The 3-shard rivet demo: same run phase, no build (expects the prebuilt release binaries).
+scripts/run-ladybug-3shard-demo.sh
 
 # Tests (release profile keeps the debug dir small).
 cargo test -p example-ladybug-graph --release

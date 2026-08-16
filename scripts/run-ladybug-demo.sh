@@ -38,24 +38,40 @@ case "$mode" in
     cargo run --release -p example-ladybug-graph --bin example-ladybug-graph -- "$algo" "$@"
     ;;
   rivet)
-    echo "building engine + example (one-time)..." >&2
-    cargo build --release -p rivet-engine -p example-ladybug-graph
+    algo="${2:-kcore}"
+    case "$algo" in
+      kcore|k-core)
+        graph_algo=1
+        k="${3:-${RIVET_K:-2}}"
+        ;;
+      wcc|WCC)
+        graph_algo=2
+        k="${RIVET_K:-0}"
+        ;;
+      *)
+        echo "unknown algorithm '$algo' (expected kcore or wcc)" >&2
+        exit 1
+        ;;
+    esac
+
+    source "$(dirname "$0")/ladybug-demo-lib.sh"
+    export RIVET_ENGINE_BINARY_PATH="$PWD/target/release/rivet-engine"
+
+    # Compile phase: build the engine + example binaries once.
+    ladybug_build
+
+    # Run phase: seed a fresh store, then host the actors.  The server
+    # auto-triggers runAlgorithm and prints superstep progress; Ctrl-C to stop.
     db="${RIVET_LADYBUG_DB:-$(mktemp -d)/cluster.lbdb}"
     url="${RIVET_LADYBUG_URL:-http://127.0.0.1:8123}"
-    k="${RIVET_K:-2}"
-    echo "starting ladybug server on $url backed by $db (k=$k)..." >&2
-    ./target/release/ladybug-server --db "$db" --listen "${url#http://}" &
-    LADYBUG_SERVER_PID=$!
-    trap 'kill "$LADYBUG_SERVER_PID" 2>/dev/null || true' EXIT
-    for _ in $(seq 1 50); do
-      curl -fsS "$url/health" >/dev/null 2>&1 && break
-      sleep 0.1
-    done
+    ladybug_install_cleanup
+    ladybug_start_store "$db" "$url"
     echo "seeding graph through the columnar protocol at $url (k=$k)..." >&2
     ./target/release/server seed "$url" "$k"
-    echo "building done. Host worker+coordinator actors in one Rivet host process (remote clients of" >&2
-    echo "the ladybug server) and trigger runAlgorithm:" >&2
-    echo "  export RIVET_ENGINE_BINARY_PATH=\$PWD/target/release/rivet-engine" >&2
-    echo "  LADYBUG_DB=\$url NUM_SERVERS=3 ./target/release/server" >&2
+    echo "hosting worker + coordinator actors (auto-triggers runAlgorithm; Ctrl-C to stop)..." >&2
+    LADYBUG_DB="$url" NUM_SERVERS=3 GRAPH_K="$k" GRAPH_ALGO="$graph_algo" GRAPH_RUN_ID=1 \
+      ./target/release/server &
+    LADYBUG_HOST_PID=$!
+    wait "$LADYBUG_HOST_PID"
     ;;
 esac

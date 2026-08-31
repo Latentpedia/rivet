@@ -13,6 +13,8 @@
 //! columnar protocol in [`crate::ladybug_server`], so a [`GraphDb`] can live in a different
 //! machine than the store it reads and writes.
 
+use std::sync::OnceLock;
+
 use anyhow::{Result, bail};
 use lbug::Value;
 
@@ -23,8 +25,27 @@ use crate::{
 	props::{ColType, Properties, Table, TypedProps},
 };
 
+/// The number of shards ("servers") the vertex set is partitioned across when `NUM_SERVERS` is
+/// not set in the environment.
+pub const DEFAULT_NUM_SERVERS: i64 = 3;
+
 /// The number of shards ("servers") the vertex set is partitioned across.
-pub const NUM_SERVERS: i64 = 3;
+///
+/// Read once from the `NUM_SERVERS` environment variable (falling back to
+/// [`DEFAULT_NUM_SERVERS`]) and cached for the life of the process, so that the shard count which
+/// routes messages and assigns vertices is by construction the same one the coordinator drives.
+/// Deriving it separately in those two places is silently wrong rather than loud: a vertex on a
+/// shard nobody drives never peels, and the messages aimed at it are never consumed.
+pub fn num_servers() -> i64 {
+	static NUM_SERVERS: OnceLock<i64> = OnceLock::new();
+	*NUM_SERVERS.get_or_init(|| {
+		std::env::var("NUM_SERVERS")
+			.ok()
+			.and_then(|value| value.parse::<i64>().ok())
+			.filter(|count| *count > 0)
+			.unwrap_or(DEFAULT_NUM_SERVERS)
+	})
+}
 
 /// Declared table schemas. These are the strong types of the platform: an algorithm declares its
 /// node/rel tables here and then only ever creates/reads rows whose shape matches.
@@ -246,7 +267,7 @@ impl GraphDb {
 		payload: i64,
 		round: i64,
 	) -> Result<()> {
-		let server = to_id % NUM_SERVERS;
+		let server = to_id % num_servers();
 		self.update(&format!(
 			"CREATE (:Msg {{to_id: {to_id}, server: {server}, kind: {kind}, payload: {payload}, round: {round}}})"
 		))
@@ -401,7 +422,7 @@ pub fn seed_edges(db: &mut GraphDb, edges: &[(i64, i64)]) -> Result<Vec<Vertex>>
 
 	let mut vertices = Vec::with_capacity(ids.len());
 	for id in ids {
-		let server = id % NUM_SERVERS;
+		let server = id % num_servers();
 		let degree = deg[&id];
 		let v = Vertex {
 			id,

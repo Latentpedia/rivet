@@ -31,7 +31,7 @@
 
 use anyhow::{Context, Result, bail};
 
-use crate::graph::{GraphDb, NUM_SERVERS, Vertex};
+use crate::graph::{GraphDb, Vertex, num_servers};
 
 /// Message kinds written to the shared `Msg` table.
 pub mod kind {
@@ -153,7 +153,7 @@ fn run_vertex(
 	Ok(())
 }
 
-/// Drives an algorithm to a fixed point across `NUM_SERVERS` shards and persists the final state.
+/// Drives an algorithm to a fixed point across `num_servers` shards and persists the final state.
 ///
 /// This is the coordinator. It is shard-agnostic; it only advances the superstep barrier and
 /// counts messages, both through ADBC reads/writes on the shared store.
@@ -186,7 +186,7 @@ impl Coordinator {
 				bail!("algorithm did not converge within {MAX_SUPERSTEPS} supersteps");
 			}
 			produced = 0;
-			for shard in 0..NUM_SERVERS {
+			for shard in 0..num_servers() {
 				produced += run_superstep(&mut self.db, shard, round, algo)?;
 			}
 			round += 1;
@@ -194,7 +194,7 @@ impl Coordinator {
 
 		// Finalize: surviving k-core vertices carry the core value; report all vertices.
 		if let Algorithm::KCore { k } = algo {
-			for shard in 0..NUM_SERVERS {
+			for shard in 0..num_servers() {
 				for v in self.db.read_vertices(shard)? {
 					if v.active {
 						let survivor = Vertex { core: k, ..v };
@@ -209,7 +209,7 @@ impl Coordinator {
 		self.db.clear_msgs()?;
 
 		let mut vertices = Vec::new();
-		for shard in 0..NUM_SERVERS {
+		for shard in 0..num_servers() {
 			vertices.extend(self.db.read_vertices(shard)?);
 		}
 		vertices.sort_by_key(|v| v.id);

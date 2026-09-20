@@ -9,7 +9,7 @@ description = "A platform for running distributed message-passing graph algorith
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-lbug = { version = "0.20", default-features = false }
+lbug = { path = "../../../../ladybug-rust", default-features = false }
 adbc_core = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }

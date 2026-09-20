@@ -16,7 +16,7 @@
 use anyhow::{Context, Result, bail};
 use tracing::info;
 
-use example_ladybug_graph::ladybug_server::LadybugServer;
+use example_ladybug_graph::ladybug_server::{LadybugServer, install_local_hooks};
 
 fn init_logging() {
 	let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -48,6 +48,9 @@ fn main() -> Result<()> {
 		}
 	}
 
+	// Real engine hooks, installed before the store opens and held to process exit so
+	// they outlive every Database. Declared first so it drops last.
+	let _hooks = install_local_hooks()?;
 	let server = LadybugServer::open(&db)?;
 	let addr: std::net::SocketAddr = listen.parse().context("invalid --listen address")?;
 	let rt = tokio::runtime::Builder::new_multi_thread()

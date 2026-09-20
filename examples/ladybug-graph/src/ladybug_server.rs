@@ -28,7 +28,10 @@ use axum::{
 	response::{IntoResponse, Response},
 	routing::{get, post},
 };
-use lbug::{Connection, Database as LbugDatabase, SystemConfig, Value};
+use lbug::{
+	Callbacks, Connection, Database as LbugDatabase, PartitionRef, RoutingGuard, SystemConfig,
+	Value,
+};
 use serde_json::json;
 use tokio::sync::oneshot;
 
@@ -48,6 +51,33 @@ struct AppState {
 pub struct LadybugServer {
 	db: Arc<LbugDatabase>,
 	write_lock: Arc<std::sync::Mutex<()>>,
+}
+
+/// Installs the real engine partition-routing hooks for this server process: every
+/// partition stays local, and lifecycle transitions are logged. Must be called before
+/// opening any Database; the returned guard must outlive all Databases, so binaries hold
+/// it for the whole process. Tests that claim remote partitions install their own guard
+/// instead — hooks are process-global, so only one installation lives at a time.
+pub fn install_local_hooks() -> Result<RoutingGuard> {
+	RoutingGuard::install(Callbacks {
+		locate: None,
+		on_partition_create: Some(Box::new(|r: PartitionRef| {
+			tracing::info!(
+				parent = r.parent_table_id,
+				partition = r.partition_index,
+				"partition created"
+			);
+		})),
+		on_partition_drop: Some(Box::new(|r: PartitionRef| {
+			tracing::info!(
+				parent = r.parent_table_id,
+				partition = r.partition_index,
+				"partition dropped"
+			);
+		})),
+		insert_row: None,
+	})
+	.map_err(|e| anyhow!("install partition routing hooks: {e}"))
 }
 
 impl LadybugServer {

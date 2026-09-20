@@ -60,13 +60,14 @@ store over the **`adbc_core`** (ADBC / Arrow Database Connectivity) interface.
   stays `PARTITION BY HASH(server)` — messages route to fixed compute shards, not communities.
   Point writes go through the parent and the engine routes them; cluster-colocated reads
   address their partition subgraph directly (pruned, then filtered).
-- **Distribution-hook routing** (`src/partitioning.rs`). `PartitionRouter` implements the
-  wrapper side of LadybugDB's distributed partition-routing hooks (PR `LadybugDB/ladybug#829`,
-  `PartitionRoutingHooks`): catalog-discovered cluster placement (`locate`), per-partition
-  cluster scans (`bindScan`), key-routed writes (`insertRow`/`insertChunk`), and lifecycle
-  logging (`onPartitionCreate`/`onPartitionDrop`). The `lbug` Rust crate does not yet bind
-  `setPartitionRoutingHooks`, so the router makes the same decisions at the client layer;
-  moving them into real hooks later changes no query shape.
+- **Distribution-hook routing** (`src/ladybug_server.rs`, `tests/routing.rs`). The server
+  process installs the real engine hooks (`lbug::RoutingGuard`, over
+  `PartitionRoutingHooks` from PR `LadybugDB/ladybug#829`) at startup: every partition
+  stays local, with lifecycle transitions logged. `tests/routing.rs` proves the full
+  remote loop through the engine — claiming a dedicated table's partitions, serving
+  point and `COPY` writes from the bundled row store, and reading them back via parent
+  scans. `PartitionRouter` (`src/partitioning.rs`) remains as the client-side complement
+  for placement discovery and direct-partition reads of local tables.
 
 ## How the columnar RPC works
 
@@ -163,8 +164,12 @@ Four engine boundaries shape how the example uses partitioned tables:
   `wcc_collapses_partitions`.
 
 Primary-key uniqueness is enforced per partition, and `Run` stays a plain table (one row per
-run, not per shard). The example pins `lbug 0.20`, whose prebuilt engine carries partitioned
-tables, LIST routing, and the routing-hook support.
+run, not per shard). The example depends on `lbug` by path (`../../../../ladybug-rust`)
+so it builds against the routing-hooks bindings; switch back to a version requirement
+once a release containing them is cut. Building also needs engine headers carrying the
+hooks — provided here by `LBUG_LIBRARY_DIR`/`LBUG_INCLUDE_DIR` pointing at a ladybug
+build tree newer than PR `LadybugDB/ladybug#1005` (plus `LBUG_SHARED=1` and the lib dir
+on the loader path at test time).
 
 ## The single-writer-served-store constraint
 

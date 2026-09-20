@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use example_ladybug_graph::algorithm::Algorithm;
 use example_ladybug_graph::graph::{GraphDb, NUM_SERVERS, seed_demo_graph};
-use example_ladybug_graph::ladybug_server::{LadybugServer, ServerHandle};
+use example_ladybug_graph::ladybug_server::{LadybugServer, ServerHandle, install_local_hooks};
 
 const MAX_SUPERSTEPS: i64 = 10_000;
 
@@ -97,6 +97,8 @@ fn main() -> Result<()> {
 	std::fs::create_dir_all(&dir).context("create demo dir")?;
 	let db_path = dir.join("demo.lbdb");
 
+	// Real engine hooks, installed before the store opens and held to process exit.
+	let _hooks = install_local_hooks()?;
 	// One LadybugDB server owns the file; the shard workers are remote clients of it.
 	let server = LadybugServer::open(&db_path)?;
 	let handle = ServerHandle::start(server)?;

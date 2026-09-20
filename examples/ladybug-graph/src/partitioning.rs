@@ -16,9 +16,14 @@
 //! | `insertRow()` / `insertChunk()` | where a routed write lands | writes go through the parent so the engine routes them; see below |
 //! | `lookupRow()` | MERGE-match materialization | not needed: the algorithm never MERGEs across partitions |
 //!
-//! The `lbug` Rust crate does not yet bind `setPartitionRoutingHooks`, so the router implements
-//! the same decisions at the client layer, over the ADBC bridge. The semantics are identical to
-//! what an in-engine wrapper would enforce:
+//! The `lbug` Rust crate binds `setPartitionRoutingHooks` (`lbug::RoutingGuard`), and the
+//! server process installs real hooks at startup (see
+//! [`crate::ladybug_server::install_local_hooks`]): all partitions stay local there, with
+//! lifecycle transitions logged. This router remains as the client-side complement — it
+//! discovers the engine's placement for direct-partition reads and mirrors lifecycle —
+//! while true remote placement lives in engine hooks (exercised by `tests/routing.rs`,
+//! which claims a dedicated table through a real guard). The semantics are identical to
+//! what an in-engine wrapper enforces:
 //!
 //! - **The engine owns the placement map.** [`PartitionRouter::partition_for_cluster`] never
 //!   computes placement locally; it reads the engine's own catalog (`CALL show_tables()` plus

@@ -48,9 +48,25 @@ store over the **`adbc_core`** (ADBC / Arrow Database Connectivity) interface.
     sends *decrement* messages to its neighbors; survivors are the k-core (persisted
     `active = true, core = k`).
   - `Wcc` — components: a vertex adopts the smallest component label it hears and propagates the
-    improvement (persisted in `value`).
+    improvement. The label is the live `cluster` partition key, so every improvement
+    physically migrates the row with delete + insert (`GraphDb::move_vertex_to_cluster`);
+    the label is also mirrored in `value`.
 - **Persistence** — every algorithm ends by persisting its result back into the graph (`Vertex`
   rows), verified by re-opening the store.
+- **Partitioned storage** (`src/partitioning.rs`, `src/graph.rs`). `Vertex` is
+  `PARTITION BY LIST(cluster)`: one partition subgraph per live community, created on demand
+  at first sight of a new cluster value. Each vertex starts as its own community
+  (`cluster = id`); WCC merges them until connected components share one partition. `Msg`
+  stays `PARTITION BY HASH(server)` — messages route to fixed compute shards, not communities.
+  Point writes go through the parent and the engine routes them; cluster-colocated reads
+  address their partition subgraph directly (pruned, then filtered).
+- **Distribution-hook routing** (`src/partitioning.rs`). `PartitionRouter` implements the
+  wrapper side of LadybugDB's distributed partition-routing hooks (PR `LadybugDB/ladybug#829`,
+  `PartitionRoutingHooks`): catalog-discovered cluster placement (`locate`), per-partition
+  cluster scans (`bindScan`), key-routed writes (`insertRow`/`insertChunk`), and lifecycle
+  logging (`onPartitionCreate`/`onPartitionDrop`). The `lbug` Rust crate does not yet bind
+  `setPartitionRoutingHooks`, so the router makes the same decisions at the client layer;
+  moving them into real hooks later changes no query shape.
 
 ## How the columnar RPC works
 
@@ -120,6 +136,36 @@ converged after 4 supersteps (8 vertices)
   vertex  7  server 1  degree 0  core 2  [OUT]   <- pendant tail peeled off by message passing
 ```
 
+## Partitioning notes
+
+Four engine boundaries shape how the example uses partitioned tables:
+
+- **LIST partitions are born on demand.** `PARTITION BY LIST(cluster)` takes no partition
+  count: the DDL-time `Vertex_p0` stays empty and each new cluster value mints its own
+  subgraph inside the writing transaction. The router discovers the engine's value map from
+  the catalog (`CALL show_tables()` + one `LIMIT 1` sample per partition) and merges
+  discoveries forever — a partition keeps its key even after its last row migrates away.
+  Covered by `list_partitions_map_each_initial_cluster`.
+- **The partition key moves by delete + insert, never in place.** `SET cluster` is refused
+  with a delete-and-reinsert hint, so `GraphDb::move_vertex_to_cluster` reads the row and its
+  adjacency, `DETACH DELETE`s it, re-creates it with the new cluster, and rewires its
+  incident edges onto the concrete partition pairs. `value`, `degree`, `core`, and `active`
+  ride along verbatim. Covered by `set_partition_key_is_refused` and
+  `move_vertex_migrates_row_and_rewires_edges`.
+- **Rel coverage freezes at rel-table creation.** A partition born after `Edge` is declared
+  has no rel pairs, so seeding writes every vertex (one cluster each) *before* declaring the
+  rel table, and WCC only ever moves vertices onto already-seeded values — the domain stays
+  complete. Rel *writes* name concrete `Vertex_p<i>` pairs; rel *reads* cross partitions
+  through the parent union. Covered by `edges_span_partitions`.
+- **Compute sharding is orthogonal to storage partitioning.** Workers still own fixed
+  `server` shards (read through the parent union), while rows physically cluster by live
+  community. A connected WCC run ends with all rows in one partition. Covered by
+  `wcc_collapses_partitions`.
+
+Primary-key uniqueness is enforced per partition, and `Run` stays a plain table (one row per
+run, not per shard). The example pins `lbug 0.20`, whose prebuilt engine carries partitioned
+tables, LIST routing, and the routing-hook support.
+
 ## The single-writer-served-store constraint
 
 LadybugDB is an embedded store: exactly one `lbug` instance may hold a database file open at a
@@ -137,7 +183,8 @@ standalone demo all point at the server and talk to it through `adbc_core`.
 | `src/ladybug_server.rs` | the server process: owns the lbug file, serializes writers, encodes Arrow IPC |
 | `src/adbc.rs` | the ADBC client driver over the remote columnar protocol |
 | `src/props.rs` | strongly typed property builders (`props!`, `TypedProps`, `Table`) |
-| `src/graph.rs` | typed application layer: table schemas, `Vertex`/`Msg`/`Run` rows, `GraphDb` facade |
+| `src/graph.rs` | typed application layer: partitioned table schemas, `Vertex`/`Msg`/`Run` rows, `GraphDb` facade |
+| `src/partitioning.rs` | partition router mirroring the distributed routing hooks (cluster placement, partition scans, lifecycle) |
 | `src/algorithm.rs` | superstep engine + `KCore` / `Wcc` + coordinator |
 | `src/actors.rs` | Rivet `VertexWorker` / `Coordinator` actors (control plane over Rivet) |
 | `src/bin/ladybug-server.rs` | the LadybugDB server binary |

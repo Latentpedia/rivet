@@ -27,7 +27,9 @@
 //!   as `active = true, core = k`.
 //! - [`Algorithm::Wcc`] — weakly connected components. Components are labels; each vertex adopts
 //!   the smallest label it hears (its own to start) and propagates the improvement to its
-//!   neighbors. The final per-vertex label is persisted in `value`.
+//!   neighbors. The label is the live `cluster` partition key, so every improvement physically
+//!   migrates the row with delete + insert ([`GraphDb::move_vertex_to_cluster`]); the final
+//!   per-vertex label is also mirrored in `value`.
 
 use anyhow::{Context, Result, bail};
 
@@ -123,19 +125,23 @@ fn run_vertex(
 			}
 		}
 		Algorithm::Wcc => {
-			// Smallest component label this vertex hears.
-			let mut label = v.value;
+			// Smallest component label this vertex hears. The label is the live cluster key.
+			let mut label = v.cluster;
 			for (to, k2, p) in msgs {
 				if *to == v.id && *k2 == kind::COMPONENT && *p < label {
 					label = *p;
 				}
 			}
-			if label < v.value {
+			if label < v.cluster {
+				// Join the better community: delete + insert migrates the row into the
+				// label's partition (the engine refuses in-place partition-key updates)
+				// and rewires its incident edges. `value` mirrors the label.
 				let updated = Vertex {
 					value: label,
 					..v.clone()
 				};
-				db.persist_vertex(&updated).context("persist wcc label")?;
+				db.move_vertex_to_cluster(&updated, label)
+					.context("migrate wcc vertex")?;
 				for n in db.neighbors(v.id)? {
 					db.write_msg_round(n, kind::COMPONENT, label, round)?;
 					*produced += 1;
@@ -144,7 +150,7 @@ fn run_vertex(
 				// Seed: in the first superstep each vertex offers its own label to its neighbors
 				// so propagation has a starting point.
 				for n in db.neighbors(v.id)? {
-					db.write_msg_round(n, kind::COMPONENT, v.value, round)?;
+					db.write_msg_round(n, kind::COMPONENT, v.cluster, round)?;
 					*produced += 1;
 				}
 			}

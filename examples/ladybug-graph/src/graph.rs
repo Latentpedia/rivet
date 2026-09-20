@@ -20,6 +20,7 @@ use adbc_core::sync::Driver;
 
 use crate::{
 	adbc::{LadybugDb, LadybugDriver},
+	partitioning::{Location, PartitionRouter},
 	props::{ColType, Properties, Table, TypedProps},
 };
 
@@ -34,6 +35,7 @@ pub fn vertex_table() -> Table {
 		vec![
 			("id", ColType::Int64),
 			("server", ColType::Int64),
+			("cluster", ColType::Int64),
 			("value", ColType::Int64),
 			("degree", ColType::Int64),
 			("core", ColType::Int64),
@@ -48,6 +50,9 @@ pub fn vertex_table() -> Table {
 pub struct Vertex {
 	pub id: i64,
 	pub server: i64,
+	/// Live computed community id. This is the LIST partition key: the row physically lives
+	/// in the partition subgraph holding this value.
+	pub cluster: i64,
 	pub value: i64,
 	pub degree: i64,
 	pub core: i64,
@@ -59,6 +64,7 @@ impl Vertex {
 		Ok(crate::props! {
 			"id" => self.id,
 			"server" => self.server,
+			"cluster" => self.cluster,
 			"value" => self.value,
 			"degree" => self.degree,
 			"core" => self.core,
@@ -66,8 +72,8 @@ impl Vertex {
 		})
 	}
 
-	/// Parses a row of `[id, server, value, degree, core, active]` (the projection order used by
-	/// [`GraphDb::read_vertices`]).
+	/// Parses a row of `[id, server, cluster, value, degree, core, active]` (the projection
+	/// order used by [`GraphDb::read_vertices`] and friends).
 	pub fn parse(cells: &[Option<Value>]) -> Result<Vertex> {
 		let mut it = cells.iter();
 		fn i64_cell(it: &mut std::slice::Iter<Option<Value>>) -> Result<i64> {
@@ -78,6 +84,7 @@ impl Vertex {
 		}
 		let id = i64_cell(&mut it)?;
 		let server = i64_cell(&mut it)?;
+		let cluster = i64_cell(&mut it)?;
 		let value = i64_cell(&mut it)?;
 		let degree = i64_cell(&mut it)?;
 		let core = i64_cell(&mut it)?;
@@ -88,6 +95,7 @@ impl Vertex {
 		Ok(Vertex {
 			id,
 			server,
+			cluster,
 			value,
 			degree,
 			core,
@@ -105,8 +113,14 @@ pub struct Edge {
 
 /// An ADBC-backed graph database facade. Owns the ADBC database handle; every operation is a
 /// parameterized Cypher statement executed through [`adbc_core`].
+///
+/// `Vertex` is LIST-partitioned by its live computed `cluster` column (one partition subgraph
+/// per community) while `Msg` is HASH-partitioned by target `server` shard, and
+/// [`PartitionRouter`] tracks the wrapper side of that contract: which partition subgraph
+/// serves each cluster or shard, plus the lifecycle of the partitioned tables.
 pub struct GraphDb {
 	db: LadybugDb,
+	router: PartitionRouter,
 }
 
 impl GraphDb {
@@ -118,7 +132,32 @@ impl GraphDb {
 		let db = driver
 			.new_database()
 			.map_err(|e| anyhow::anyhow!("adbc open failed: {e}"))?;
-		Ok(GraphDb { db })
+		Ok(GraphDb {
+			db,
+			router: PartitionRouter::new(NUM_SERVERS),
+		})
+	}
+
+	/// The partition router modelling the distributed wrapper contract (placement, lifecycle).
+	pub fn router(&mut self) -> &mut PartitionRouter {
+		&mut self.router
+	}
+
+	/// The partition subgraph holding `cluster` (e.g. `Vertex_p2`). Cluster-colocated reads
+	/// address this table directly instead of scanning the parent union, which is the
+	/// client-side form of the `bindScan` hook.
+	pub fn vertex_partition_for_cluster(&mut self, cluster: i64) -> Result<String> {
+		let table = self.router.partition_for_cluster(&mut self.db, cluster)?;
+		assert_eq!(self.router.locate(&table), Location::Local);
+		Ok(table)
+	}
+
+	/// The partition subgraph serving a shard's messages (e.g. `Msg_p1`).
+	pub fn msg_partition(&mut self, server: i64) -> Result<String> {
+		let index = self.router.msg_placement(&mut self.db, server)?;
+		let table = self.router.table_for("Msg", index);
+		assert_eq!(self.router.locate(&table), Location::Local);
+		Ok(table)
 	}
 
 	// -- low-level ADBC passthrough -------------------------------------------
@@ -146,6 +185,13 @@ impl GraphDb {
 		Ok(())
 	}
 
+	pub fn update_params(&mut self, cypher: &str, params: &[(&str, Value)]) -> Result<()> {
+		self.db
+			.update_params(cypher, params)
+			.map_err(|e| anyhow::anyhow!("adbc update failed: {e}"))?;
+		Ok(())
+	}
+
 	pub fn scalar_i64(&mut self, cypher: &str) -> Result<Option<i64>> {
 		self.db
 			.scalar_i64(cypher)
@@ -154,17 +200,34 @@ impl GraphDb {
 
 	// -- schema + seeding (all through typed properties) ----------------------
 
-	/// Creates the node/rel/message/run table schemas and seeds the graph.
+	/// Creates the node/message/run table schemas (the `Edge` rel table is created by
+	/// [`seed_edges`], after the first rows exist — see below).
+	///
+	/// `Vertex` is LIST-partitioned by its live computed `cluster` column: each community
+	/// physically lives in its own partition subgraph, created on demand at first sight of a
+	/// new value. `Msg` is HASH-partitioned by target `server` shard (messages route to fixed
+	/// compute shards, not to communities). `Run` stays a plain table: one row per run.
+	///
+	/// The rel table must come after the first vertex writes: rel coverage over a
+	/// LIST-partitioned parent is frozen when the rel table is created, so a partition born
+	/// later would have no rel pairs. Seeding creates every initial cluster up front (each
+	/// vertex starts as its own community, `cluster = id`), and algorithms only ever move
+	/// vertices onto values that already exist, so the domain is complete before `Edge` is
+	/// declared.
 	pub fn create_schema(&mut self) -> Result<()> {
 		self.update(
-			"CREATE NODE TABLE IF NOT EXISTS Vertex(id INT64, server INT64, value INT64, \
-			 degree INT64, core INT64, active BOOLEAN, PRIMARY KEY(id))",
+			"CREATE NODE TABLE IF NOT EXISTS Vertex(id INT64, server INT64, cluster INT64, \
+			 value INT64, degree INT64, core INT64, active BOOLEAN, PRIMARY KEY(id)) \
+			 PARTITION BY LIST(cluster)",
 		)?;
-		self.update("CREATE REL TABLE IF NOT EXISTS Edge(FROM Vertex TO Vertex)")?;
-		self.update(
+		self.router.note_created("Vertex", "LIST(cluster)");
+		self.update(&format!(
 			"CREATE NODE TABLE IF NOT EXISTS Msg(msg_id SERIAL, to_id INT64, server INT64, \
-			 kind INT64, payload INT64, round INT64, PRIMARY KEY(msg_id))",
-		)?;
+			 kind INT64, payload INT64, round INT64, PRIMARY KEY(msg_id)) \
+			 PARTITION BY HASH(server) PARTITIONS {NUM_SERVERS}",
+		))?;
+		self.router
+			.note_created("Msg", &format!("HASH(server) x{NUM_SERVERS}"));
 		self.update(
 			"CREATE NODE TABLE IF NOT EXISTS Run(run_id INT64, k INT64, rounds INT64, \
 			 done BOOLEAN, PRIMARY KEY(run_id))",
@@ -172,13 +235,16 @@ impl GraphDb {
 		Ok(())
 	}
 
-	/// Inserts a vertex row through the typed schema-checked builder.
+	/// Inserts a vertex row through the typed schema-checked builder. The write goes through
+	/// the parent, so the engine routes it to the `cluster` partition, creating that
+	/// partition on first sight of a new value.
 	pub fn create_vertex(&mut self, v: &Vertex) -> Result<()> {
 		let table = vertex_table();
 		let typed = TypedProps::new(table);
 		let kv = typed
 			.try_set("id", v.id)?
 			.try_set("server", v.server)?
+			.try_set("cluster", v.cluster)?
 			.try_set("value", v.value)?
 			.try_set("degree", v.degree)?
 			.try_set("core", v.core)?
@@ -194,14 +260,100 @@ impl GraphDb {
 		self.update(&format!("CREATE (:Vertex {{{parts}}})"))
 	}
 
-	/// Reads the vertices owned by `server` (that server's shard), in `id` order.
+	/// Reads the vertices owned by `server` (that server's compute shard), in `id` order.
+	///
+	/// Compute sharding (`server`) is orthogonal to storage partitioning (`cluster`): a
+	/// shard's vertices scatter across community partitions as labels evolve, so this reads
+	/// the parent union filtered by shard. Cluster-colocated reads use [`GraphDb::read_cluster`].
 	pub fn read_vertices(&mut self, server: i64) -> Result<Vec<Vertex>> {
 		let rows = self.query_params(
 			"MATCH (v:Vertex) WHERE v.server = $s \
-			 RETURN v.id, v.server, v.value, v.degree, v.core, v.active ORDER BY v.id",
+			 RETURN v.id, v.server, v.cluster, v.value, v.degree, v.core, v.active ORDER BY v.id",
 			&[("s", Value::Int64(server))],
 		)?;
 		rows.iter().map(|r| Vertex::parse(r)).collect()
+	}
+
+	/// Reads one vertex by id, or `None` when absent.
+	pub fn read_vertex(&mut self, id: i64) -> Result<Option<Vertex>> {
+		let rows = self.query_params(
+			"MATCH (v:Vertex {id: $id}) \
+			 RETURN v.id, v.server, v.cluster, v.value, v.degree, v.core, v.active",
+			&[("id", Value::Int64(id))],
+		)?;
+		rows.first().map(|r| Vertex::parse(r)).transpose()
+	}
+
+	/// Reads every vertex currently in `cluster`, in `id` order, straight from that community's
+	/// partition subgraph (pruned, then filtered) — the client-side form of the `bindScan` hook.
+	pub fn read_cluster(&mut self, cluster: i64) -> Result<Vec<Vertex>> {
+		let table = self.vertex_partition_for_cluster(cluster)?;
+		let rows = self.query_params(
+			&format!(
+				"MATCH (v:{table}) WHERE v.cluster = $c \
+			 RETURN v.id, v.server, v.cluster, v.value, v.degree, v.core, v.active ORDER BY v.id"
+			),
+			&[("c", Value::Int64(cluster))],
+		)?;
+		rows.iter().map(|r| Vertex::parse(r)).collect()
+	}
+
+	/// Moves a vertex to another cluster with delete + insert: the engine refuses in-place
+	/// updates of the partition column, so the row is `DETACH DELETE`d and re-created with the
+	/// new `cluster`, and its incident edges are rewired onto the concrete partition pairs.
+	/// Every other field is preserved verbatim from `v` (pass the row with any computed fields
+	/// such as `value` already updated). Returns the re-created row.
+	pub fn move_vertex_to_cluster(&mut self, v: &Vertex, new_cluster: i64) -> Result<Vertex> {
+		if v.cluster == new_cluster {
+			return Ok(v.clone());
+		}
+		// Adjacency first: the delete below removes every edge incident to this vertex.
+		let adjacent = self.neighbors(v.id)?;
+		// Fresh clusters for the rewired endpoints (neighbors may have moved already).
+		let mut neighbor_cluster = std::collections::HashMap::new();
+		for n in &adjacent {
+			let row = self
+				.read_vertex(*n)?
+				.ok_or_else(|| anyhow::anyhow!("edge neighbor {n} has no vertex row"))?;
+			neighbor_cluster.insert(*n, row.cluster);
+		}
+		self.update_params(
+			"MATCH (x:Vertex {id: $id}) DETACH DELETE x",
+			&[("id", Value::Int64(v.id))],
+		)?;
+		let moved = Vertex {
+			cluster: new_cluster,
+			..v.clone()
+		};
+		self.create_vertex(&moved)?;
+		// The insert may have created a brand-new partition; pick up the engine's map.
+		self.router.refresh_clusters(&mut self.db)?;
+		for n in &adjacent {
+			self.create_edge_directed(v.id, new_cluster, *n, neighbor_cluster[n])?;
+			self.create_edge_directed(*n, neighbor_cluster[n], v.id, new_cluster)?;
+		}
+		Ok(moved)
+	}
+
+	/// Creates one directed edge against the concrete partition pair. The engine refuses
+	/// parent-bound rel writes on partitioned tables, so both endpoints resolve to their
+	/// `<parent>_p<i>` tables first.
+	pub fn create_edge_directed(
+		&mut self,
+		from_id: i64,
+		from_cluster: i64,
+		to_id: i64,
+		to_cluster: i64,
+	) -> Result<()> {
+		let from_table = self.vertex_partition_for_cluster(from_cluster)?;
+		let to_table = self.vertex_partition_for_cluster(to_cluster)?;
+		self.update_params(
+			&format!(
+				"MATCH (x:{from_table} {{id: $a}}), (y:{to_table} {{id: $b}}) \
+				 CREATE (x)-[:Edge]->(y)"
+			),
+			&[("a", Value::Int64(from_id)), ("b", Value::Int64(to_id))],
+		)
 	}
 
 	/// Returns the outgoing neighbors of `v` (undirected edges are stored both directions).
@@ -253,9 +405,13 @@ impl GraphDb {
 	}
 
 	/// Reads messages of one round targeting `server`'s shard, returning `(to_id, kind, payload)`.
+	/// Like [`GraphDb::read_vertices`], this reads the shard's `Msg` partition directly.
 	pub fn read_msgs_round(&mut self, server: i64, round: i64) -> Result<Vec<(i64, i64, i64)>> {
+		let table = self.msg_partition(server)?;
 		let rows = self.query_params(
-			"MATCH (m:Msg) WHERE m.server = $s AND m.round = $r RETURN m.to_id, m.kind, m.payload",
+			&format!(
+				"MATCH (m:{table}) WHERE m.server = $s AND m.round = $r RETURN m.to_id, m.kind, m.payload"
+			),
 			&[("s", Value::Int64(server)), ("r", Value::Int64(round))],
 		)?;
 		Ok(rows
@@ -342,6 +498,9 @@ impl GraphDb {
 	}
 
 	/// Persists a vertex's computed result back into the graph (the final step of every algorithm).
+	/// Only non-partition columns are set: `cluster` is deliberately excluded, since the engine
+	/// refuses partition-column updates — community changes go through
+	/// [`GraphDb::move_vertex_to_cluster`] instead.
 	pub fn persist_vertex(&mut self, v: &Vertex) -> Result<()> {
 		self.update(&format!(
 			"MATCH (x:Vertex {{id: {}}}) SET x.value = {}, x.core = {}, x.active = {}, x.degree = {}",
@@ -388,8 +547,16 @@ pub fn seed_demo_graph(db: &mut GraphDb) -> Result<Vec<Vertex>> {
 	seed_edges(db, edges)
 }
 
-/// Seeds the given undirected edges: creates the `Vertex` rows (with per-shard routing, initial
-/// degree, value = own id) and both directed `Edge` relationships.
+/// Seeds the given undirected edges: creates the `Vertex` rows (per-shard compute routing,
+/// each vertex its own initial community `cluster = id`, initial degree, value = own id) and
+/// both directed `Edge` relationships.
+///
+/// Vertices are created through the parent so the engine routes each row to its cluster
+/// partition, creating it on demand. The `Edge` rel table is declared *after* those writes so
+/// its rel pairs cover every initial cluster: rel coverage over a LIST parent is frozen at
+/// rel-table creation, and a later-born partition would have no pairs. Algorithms only move
+/// vertices onto already-seeded cluster values, so the domain stays complete. Edges name
+/// concrete partitions (the engine refuses parent-bound rel writes on partitioned tables).
 pub fn seed_edges(db: &mut GraphDb, edges: &[(i64, i64)]) -> Result<Vec<Vertex>> {
 	let mut deg: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
 	for (a, b) in edges {
@@ -406,6 +573,7 @@ pub fn seed_edges(db: &mut GraphDb, edges: &[(i64, i64)]) -> Result<Vec<Vertex>>
 		let v = Vertex {
 			id,
 			server,
+			cluster: id,
 			value: id,
 			degree,
 			core: 0,
@@ -415,13 +583,22 @@ pub fn seed_edges(db: &mut GraphDb, edges: &[(i64, i64)]) -> Result<Vec<Vertex>>
 		vertices.push(v);
 	}
 
+	// Declare rels once every initial cluster partition exists, so all pairs are covered.
+	db.update("CREATE REL TABLE IF NOT EXISTS Edge(FROM Vertex TO Vertex)")?;
+	db.router.refresh_clusters(&mut db.db)?;
+
+	let cluster_of: std::collections::HashMap<i64, i64> =
+		vertices.iter().map(|v| (v.id, v.cluster)).collect();
+	let cluster = |id: &i64| {
+		cluster_of
+			.get(id)
+			.copied()
+			.ok_or_else(|| anyhow::anyhow!("edge endpoint {id} has no seeded vertex"))
+	};
 	for (a, b) in edges {
-		db.update(&format!(
-			"MATCH (x:Vertex {{id: {a}}}), (y:Vertex {{id: {b}}}) CREATE (x)-[:Edge]->(y)"
-		))?;
-		db.update(&format!(
-			"MATCH (x:Vertex {{id: {b}}}), (y:Vertex {{id: {a}}}) CREATE (x)-[:Edge]->(y)"
-		))?;
+		let (ca, cb) = (cluster(a)?, cluster(b)?);
+		db.create_edge_directed(*a, ca, *b, cb)?;
+		db.create_edge_directed(*b, cb, *a, ca)?;
 	}
 	Ok(vertices)
 }

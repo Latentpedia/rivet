@@ -152,9 +152,21 @@ impl LadybugDb {
 
 	/// Runs a Cypher write through the ADBC [`Statement::execute_update`] path.
 	pub fn update(&mut self, cypher: &str) -> AdbcResult<Option<i64>> {
+		self.update_params(cypher, &[])
+	}
+
+	/// Runs a parameterized Cypher write through the ADBC [`Statement::execute_update`] path.
+	pub fn update_params(
+		&mut self,
+		cypher: &str,
+		params: &[(&str, Value)],
+	) -> AdbcResult<Option<i64>> {
 		let mut conn = self.new_connection()?;
 		let mut stmt = conn.new_statement()?;
 		stmt.set_sql_query(cypher)?;
+		for (k, v) in params {
+			stmt.params.push((k.to_string(), v.clone()));
+		}
 		stmt.execute_update()
 	}
 

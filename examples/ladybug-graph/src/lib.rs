@@ -13,7 +13,12 @@
 //!   columnar ADBC protocol (Arrow IPC over HTTP) to remote clients.
 //! - [`protocol`] — the wire contract shared by the server and the ADBC client.
 //! - [`graph`] — the strongly typed application layer over ADBC: declares node/rel table schemas,
-//!   persists typed rows, and reads them back as typed objects.
+//!   persists typed rows, and reads them back as typed objects. `Vertex` is LIST-partitioned
+//!   by its live computed `cluster` column (one partition per community; moves go through
+//!   delete + insert); `Msg` is HASH-partitioned by target shard.
+//! - [`partitioning`] — the client-side partition router mirroring the distributed
+//!   partition-routing hooks: catalog-discovered cluster placement, per-partition cluster
+//!   scans, lifecycle.
 //! - [`algorithm`] — distributed message-passing graph algorithms (k-core, weak connectivity) run
 //!   as supersteps over the shared graph via ADBC, with results persisted back into the store.
 //! - [`actors`] — Rivet actors that host the algorithm workers and coordinator across N local
@@ -31,5 +36,6 @@ pub mod adbc;
 pub mod algorithm;
 pub mod graph;
 pub mod ladybug_server;
+pub mod partitioning;
 pub mod props;
 mod protocol;

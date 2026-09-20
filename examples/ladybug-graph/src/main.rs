@@ -138,8 +138,8 @@ fn main() -> Result<()> {
 				v.id, v.server, v.degree, v.core
 			),
 			Algorithm::Wcc => println!(
-				"  vertex {:>2}  server {:>1}  component {:>2}",
-				v.id, v.server, v.value
+				"  vertex {:>2}  server {:>1}  cluster {:>2}  component {:>2}",
+				v.id, v.server, v.cluster, v.value
 			),
 		}
 	}

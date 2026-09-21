@@ -120,6 +120,15 @@ jobs:
           # Deny warnings
           RUSTFLAGS: --cfg tokio_unstable -D warnings -A unsafe-op-in-unsafe-fn
 
+      # The workspace check above only covers libs and bins; the ladybug-graph
+      # example's routing-hooks coverage lives in integration tests, so check all
+      # of its targets explicitly (same deny-warnings flags).
+      - name: Check ladybug-graph example
+        run: cargo check -p example-ladybug-graph --all-targets
+        env:
+          # Deny warnings
+          RUSTFLAGS: --cfg tokio_unstable -D warnings -A unsafe-op-in-unsafe-fn
+
       - name: Check Rust publish surface
         run: |
           cargo check -p rivetkit --no-default-features --features rivetkit-core/sqlite-remote

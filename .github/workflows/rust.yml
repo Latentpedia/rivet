@@ -138,6 +138,70 @@ jobs:
           fi
           cargo publish -p rivet-error-macros --dry-run
 
+  ladybug-graph-test:
+    name: Ladybug graph tests
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      # Same as `check`: the `lbug` build script downloads its prebuilt archive
+      # via `gh run download` from LadybugDB/ladybug, which needs an authenticated
+      # `gh` even for public repos.
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache-shared-key: rust-ci
+          cache-on-failure: true
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      # Same cache as `check` (shared key + main-branch fallback); RUSTFLAGS below
+      # match `check` so fingerprints — and therefore sccache hits — are shared.
+      - name: Setup ccache (Linux)
+        if: runner.os == 'Linux'
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: rust-check-ccache-${{ runner.os }}-${{ runner.arch }}-${{ github.ref }}
+          max-size: 2G
+          create-symlink: true
+          restore-keys: |
+            rust-check-ccache-${{ runner.os }}-${{ runner.arch }}-refs/heads/main
+            rust-check-ccache-${{ runner.os }}-${{ runner.arch }}-
+
+      # Same prebuilt requirement as `check`: the `lbug` headers must postdate
+      # LadybugDB/ladybug#1005 (partition routing hooks).
+      - name: Resolve ladybug prebuilt run
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          API_URL="https://api.github.com/repos/LadybugDB/ladybug/actions/workflows/build-and-deploy.yml/runs"
+          AUTH_HEADER="Authorization: Bearer $GITHUB_TOKEN"
+          ACCEPT_HEADER="Accept: application/vnd.github+json"
+          VERSION_HEADER="X-GitHub-Api-Version: 2022-11-28"
+          RUN_ID="$(curl -fsSL -H "$AUTH_HEADER" -H "$ACCEPT_HEADER" -H "$VERSION_HEADER" \
+            "$API_URL?branch=main&status=success&per_page=1" \
+            | python3 -c 'import json,sys; data=json.load(sys.stdin); runs=data.get("workflow_runs") or []; print(runs[0]["id"] if runs else "")')"
+          if [ -z "$RUN_ID" ]; then
+            echo "Could not find a successful LadybugDB/ladybug build-and-deploy run." >&2
+            exit 1
+          fi
+          echo "Using Ladybug build-and-deploy RUN_ID=$RUN_ID"
+          echo "LBUG_PRECOMPILED_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+
+      # Functional gate: spins up a real ladybug-server on ephemeral ports and
+      # drives k-core, WCC, and the routing-hooks round trip over ADBC. No engine,
+      # no fixed ports, no docker — safe on stock runners.
+      - name: Run ladybug-graph tests
+        run: cargo test -p example-ladybug-graph
+        timeout-minutes: 30
+        env:
+          # Deny warnings (matches `check`, so sccache fingerprints are shared)
+          RUSTFLAGS: --cfg tokio_unstable -D warnings -A unsafe-op-in-unsafe-fn
+
   # test:
   #   name: Test
   #   runs-on: depot-ubuntu-24.04-8
@@ -173,12 +237,12 @@ jobs:
   status-check:
     name: Rust CI Status
     runs-on: ubuntu-latest
-    needs: [fmt, check]
+    needs: [fmt, check, ladybug-graph-test]
     if: always()
     steps:
       - name: Check job status
         run: |
-          if [ "${{ needs.fmt.result }}" != "success" ] || [ "${{ needs.check.result }}" != "success" ]; then
+          if [ "${{ needs.fmt.result }}" != "success" ] || [ "${{ needs.check.result }}" != "success" ] || [ "${{ needs.ladybug-graph-test.result }}" != "success" ]; then
             echo "One or more required jobs failed"
             exit 1
           fi

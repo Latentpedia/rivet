@@ -9,7 +9,10 @@ description = "A platform for running distributed message-passing graph algorith
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-lbug = { path = "../../../../ladybug-rust", default-features = false }
+# Tracks ladybug-rust main past the routing-hooks bindings (LadybugDB/ladybug-rust#40,
+# merged as e77dabd). No published `lbug` crate carries `RoutingGuard` yet; flip back to
+# `lbug.workspace = true` once a release containing them is cut.
+lbug = { git = "https://github.com/LadybugDB/ladybug-rust", rev = "e77dabd205cc284ee73a580b6f7557db09354a29", default-features = false }
 adbc_core = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }

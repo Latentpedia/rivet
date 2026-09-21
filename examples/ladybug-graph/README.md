@@ -164,12 +164,11 @@ Four engine boundaries shape how the example uses partitioned tables:
   `wcc_collapses_partitions`.
 
 Primary-key uniqueness is enforced per partition, and `Run` stays a plain table (one row per
-run, not per shard). The example depends on `lbug` by path (`../../../../ladybug-rust`)
-so it builds against the routing-hooks bindings; switch back to a version requirement
-once a release containing them is cut. Building also needs engine headers carrying the
-hooks — provided here by `LBUG_LIBRARY_DIR`/`LBUG_INCLUDE_DIR` pointing at a ladybug
-build tree newer than PR `LadybugDB/ladybug#1005` (plus `LBUG_SHARED=1` and the lib dir
-on the loader path at test time).
+run, not per shard). The example depends on `lbug` via git (pinned past
+`LadybugDB/ladybug-rust#40`, which carries the routing-hooks bindings); switch back to a
+version requirement once a crates.io release containing them is cut. Plain prebuilt builds
+work: the shipped engine headers carry the hooks since `LadybugDB/ladybug#1005`, so no
+`LBUG_LIBRARY_DIR`/`LBUG_INCLUDE_DIR` overlay is needed.
 
 ## The single-writer-served-store constraint
 

@@ -3259,6 +3259,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 [[package]]
 name = "lbug"
 version = "0.18.0"
+source = "git+https://github.com/LadybugDB/ladybug-rust?rev=e77dabd205cc284ee73a580b6f7557db09354a29#e77dabd205cc284ee73a580b6f7557db09354a29"
 dependencies = [
  "cmake",
  "cxx",

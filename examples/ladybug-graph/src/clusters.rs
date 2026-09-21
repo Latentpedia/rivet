@@ -112,7 +112,11 @@ pub fn run_cluster_superstep(
 			continue;
 		}
 		if v.cluster != cluster {
-			bail!("vertex {} sits in partition {cluster} but claims cluster {}", v.id, v.cluster);
+			bail!(
+				"vertex {} sits in partition {cluster} but claims cluster {}",
+				v.id,
+				v.cluster
+			);
 		}
 		members.insert(v.id, v);
 	}
@@ -330,11 +334,7 @@ pub mod placement {
 	pub fn assign_lpt(costs: &HashMap<i64, i64>, hosts: &[String]) -> HashMap<String, Vec<i64>> {
 		assert!(!hosts.is_empty(), "placement needs at least one host");
 		let mut order: Vec<i64> = costs.keys().copied().collect();
-		order.sort_unstable_by(|a, b| {
-			costs[b]
-				.cmp(&costs[a])
-				.then_with(|| a.cmp(b))
-		});
+		order.sort_unstable_by(|a, b| costs[b].cmp(&costs[a]).then_with(|| a.cmp(b)));
 		let mut load: HashMap<&str, i64> = HashMap::new();
 		let mut out: HashMap<String, Vec<i64>> = HashMap::new();
 		for h in hosts {

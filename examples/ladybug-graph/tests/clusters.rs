@@ -49,13 +49,23 @@ fn seed_demo(server: &TestServer, run_id: i64, k: i64) -> GraphDb {
 fn kcore2_peels_tail_without_migrations() {
 	let server = TestServer::new();
 	let db = seed_demo(&server, 1, 2);
-	let (outcome, stats) = Coordinator::new(db).run_with_stats(Algorithm::KCore { k: 2 }).unwrap();
+	let (outcome, stats) = Coordinator::new(db)
+		.run_with_stats(Algorithm::KCore { k: 2 })
+		.unwrap();
 
-	let active: HashSet<i64> =
-		outcome.vertices.iter().filter(|v| v.active).map(|v| v.id).collect();
+	let active: HashSet<i64> = outcome
+		.vertices
+		.iter()
+		.filter(|v| v.active)
+		.map(|v| v.id)
+		.collect();
 	assert_eq!(active, HashSet::from([0, 1, 2, 3, 4]));
-	let removed: HashSet<i64> =
-		outcome.vertices.iter().filter(|v| !v.active).map(|v| v.id).collect();
+	let removed: HashSet<i64> = outcome
+		.vertices
+		.iter()
+		.filter(|v| !v.active)
+		.map(|v| v.id)
+		.collect();
 	assert_eq!(removed, HashSet::from([5, 6, 7]));
 	for v in outcome.vertices.iter().filter(|v| v.active) {
 		assert_eq!(v.core, 2);
@@ -67,7 +77,10 @@ fn kcore2_peels_tail_without_migrations() {
 		assert_eq!(v.cluster, v.id);
 	}
 	assert!(stats.remote_msgs > 0, "peeling must cross slices");
-	assert_eq!(stats.local_msgs, 0, "singleton owners never message themselves");
+	assert_eq!(
+		stats.local_msgs, 0,
+		"singleton owners never message themselves"
+	);
 
 	let mut reopened = server.open_db();
 	check_store_ownership(&mut reopened).unwrap();
@@ -80,11 +93,19 @@ fn wcc_collapses_to_one_slice_with_local_traffic() {
 	let (outcome, stats) = Coordinator::new(db).run_with_stats(Algorithm::Wcc).unwrap();
 
 	assert_eq!(
-		outcome.vertices.iter().map(|v| v.value).collect::<HashSet<_>>(),
+		outcome
+			.vertices
+			.iter()
+			.map(|v| v.value)
+			.collect::<HashSet<_>>(),
 		HashSet::from([0])
 	);
 	assert_eq!(
-		outcome.vertices.iter().map(|v| v.cluster).collect::<HashSet<_>>(),
+		outcome
+			.vertices
+			.iter()
+			.map(|v| v.cluster)
+			.collect::<HashSet<_>>(),
 		HashSet::from([0]),
 		"all rows must live in one community slice"
 	);

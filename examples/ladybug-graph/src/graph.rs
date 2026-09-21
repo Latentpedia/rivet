@@ -167,7 +167,9 @@ impl GraphDb {
 	/// it yet. A community that has never been sent a message has no partition; that reads as
 	/// an empty inbox, not an error.
 	pub fn msg_table_for_cluster(&mut self, cluster: i64) -> Result<Option<String>> {
-		let table = self.router.partition_for_opt(&mut self.db, "Msg", cluster)?;
+		let table = self
+			.router
+			.partition_for_opt(&mut self.db, "Msg", cluster)?;
 		if let Some(ref table) = table {
 			assert_eq!(self.router.locate(table), Location::Local);
 		}
@@ -474,7 +476,7 @@ impl GraphDb {
 		let rows = self.query_params(
 			&format!(
 				"MATCH (m:{table}) WHERE m.to_id = $t AND m.round = $r RETURN m.kind, m.payload"
-				),
+			),
 			&[("t", Value::Int64(to_id)), ("r", Value::Int64(round))],
 		)?;
 		let mut stragglers = Vec::new();

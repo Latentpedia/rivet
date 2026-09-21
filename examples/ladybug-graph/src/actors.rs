@@ -54,9 +54,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::algorithm::Algorithm;
-use crate::clusters::{
-	StepResult, directory, live_clusters, placement, run_cluster_superstep,
-};
+use crate::clusters::{StepResult, directory, live_clusters, placement, run_cluster_superstep};
 
 /// Names used when registering and addressing the actors.
 pub const WORKER_ACTOR: &str = "vertexWorker";
@@ -178,12 +176,14 @@ impl Actor for VertexWorker {
 
 fn worker_cluster(ctx: &Ctx<VertexWorker>) -> Result<i64> {
 	// The key names the owned cluster; fall back to persisted state.
-	if let Some(cluster) = ctx.key().as_slice().first().and_then(|segment| {
-		match segment {
+	if let Some(cluster) = ctx
+		.key()
+		.as_slice()
+		.first()
+		.and_then(|segment| match segment {
 			rivetkit::ActorKeySegment::String(s) => s.parse().ok(),
 			rivetkit::ActorKeySegment::Number(n) => Some(*n as i64),
-		}
-	}) {
+		}) {
 		return Ok(cluster);
 	}
 	Ok(ctx.state().cluster)
@@ -235,7 +235,10 @@ impl Handles<Finalize> for VertexWorker {
 			let mut stamped = 0i64;
 			for v in &members {
 				if v.active && v.core != action.k {
-					db.persist_vertex(&crate::graph::Vertex { core: action.k, ..v.clone() })?;
+					db.persist_vertex(&crate::graph::Vertex {
+						core: action.k,
+						..v.clone()
+					})?;
 					stamped += 1;
 				}
 			}
@@ -430,8 +433,7 @@ impl Handles<RunAlgorithm> for Coordinator {
 			}
 			info!(
 				total_local,
-				total_remote,
-				"message locality: local stayed inside the owning slice"
+				total_remote, "message locality: local stayed inside the owning slice"
 			);
 
 			// Finalize through the owners, then report from the store (which

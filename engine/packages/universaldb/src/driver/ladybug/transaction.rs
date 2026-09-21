@@ -1,8 +1,4 @@
-use std::{
-	future::Future,
-	pin::Pin,
-	sync::Arc,
-};
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use lbug::Value;
@@ -164,8 +160,10 @@ impl LadybugTransaction {
 
 	/// Buffers creation of a relationship between two existing nodes.
 	pub fn create_rel(&self, _spec: &LadybugRelSpec) -> Result<()> {
-		bail!("create_rel requires knowing the endpoint tables and their primary-key columns; \
-		       construct the Cypher MATCH .. CREATE statement explicitly for now")
+		bail!(
+			"create_rel requires knowing the endpoint tables and their primary-key columns; \
+		       construct the Cypher MATCH .. CREATE statement explicitly for now"
+		)
 	}
 
 	/// Buffers deletion of all nodes matching a label and predicate.
@@ -208,7 +206,8 @@ impl LadybugTransaction {
 			return Err(error);
 		}
 
-		conn.query("COMMIT").context("failed to commit ladybug transaction")?;
+		conn.query("COMMIT")
+			.context("failed to commit ladybug transaction")?;
 		inner.committed = true;
 		Ok(())
 	}
@@ -350,6 +349,12 @@ impl TransactionDriver for LadybugTransactionDriver {
 		_conflict_type: ConflictRangeType,
 	) -> Result<()> {
 		Ok(())
+	}
+
+	fn approximate_size<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<i64>> + Send + 'a>> {
+		Box::pin(async move {
+			bail!("ladybug graph driver: key/value `approximate_size` is not supported")
+		})
 	}
 
 	fn get_estimated_range_size_bytes<'a>(

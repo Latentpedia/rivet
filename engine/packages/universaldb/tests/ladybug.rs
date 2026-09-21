@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Context;
 use lbug::Value;
-use universaldb::driver::ladybug::{LadybugNodeSpec, LadybugConfig, LadybugDatabaseDriver};
+use universaldb::driver::ladybug::{LadybugConfig, LadybugDatabaseDriver, LadybugNodeSpec};
 
 static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -76,8 +76,7 @@ async fn ladybug_persistence_and_retrieval() -> anyhow::Result<()> {
 	// Drop the driver, reopen the same path, and read the graph back from disk.
 	drop(driver);
 
-	let driver =
-		LadybugDatabaseDriver::new(db_path.clone(), LadybugConfig::default()).await?;
+	let driver = LadybugDatabaseDriver::new(db_path.clone(), LadybugConfig::default()).await?;
 	let txn = driver.graph_txn();
 	let rows = txn
 		.query("MATCH (a:Person)-[r:Follows]->(b:Person) RETURN a.name, r.since, b.name")
@@ -100,9 +99,7 @@ async fn ladybug_transaction_commit_and_rollback() -> anyhow::Result<()> {
 	txn.execute("CREATE (:Person {id: 4, name: 'Dave', age: 40})");
 	txn.commit().await?;
 	let txn = driver.graph_txn();
-	let rows = txn
-		.query("MATCH (p:Person {id: 4}) RETURN p.name")
-		.await?;
+	let rows = txn.query("MATCH (p:Person {id: 4}) RETURN p.name").await?;
 	assert_eq!(rows.len(), 1);
 
 	// A transaction whose buffered writes are aborted is not visible.
@@ -110,9 +107,7 @@ async fn ladybug_transaction_commit_and_rollback() -> anyhow::Result<()> {
 	txn.execute("CREATE (:Person {id: 5, name: 'Eve', age: 50})");
 	txn.abort();
 	let txn = driver.graph_txn();
-	let rows = txn
-		.query("MATCH (p:Person {id: 5}) RETURN p.name")
-		.await?;
+	let rows = txn.query("MATCH (p:Person {id: 5}) RETURN p.name").await?;
 	assert_eq!(rows.len(), 0);
 
 	Ok(())
@@ -130,7 +125,9 @@ async fn ladybug_checkpoint() -> anyhow::Result<()> {
 	txn.commit().await?;
 
 	// Flush the write-ahead log into the data files. This must not error on a live database.
-	driver.force_checkpoint().context("force_checkpoint failed")?;
+	driver
+		.force_checkpoint()
+		.context("force_checkpoint failed")?;
 
 	// The checkpointed data is still queryable.
 	let txn = driver.graph_txn();

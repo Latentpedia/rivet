@@ -14,7 +14,7 @@ use crate::{
 	driver::{BoxFut, DatabaseDriver, Erased},
 	error::DatabaseError,
 	transaction::TXN_TIMEOUT,
-	utils::{calculate_tx_retry_backoff},
+	utils::calculate_tx_retry_backoff,
 };
 
 use super::transaction::{LadybugTransaction, LadybugTransactionDriver};
@@ -131,10 +131,7 @@ impl LadybugDatabaseDriver {
 	/// against the live graph. When the closure returns `Ok`, the buffered writes are applied
 	/// atomically inside `BEGIN TRANSACTION .. COMMIT`; on retryable failures the whole
 	/// transaction is retried with a bounded backoff.
-	pub async fn run_graph<'a, F, R>(
-		&'a self,
-		closure: F,
-	) -> Result<R>
+	pub async fn run_graph<'a, F, R>(&'a self, closure: F) -> Result<R>
 	where
 		F: Fn(LadybugTransaction) -> BoxFut<'a, Result<R>> + Send + Sync + 'a,
 		R: Send + 'a,
@@ -167,7 +164,10 @@ impl LadybugDatabaseDriver {
 			return Err(result);
 		}
 
-		Err(DatabaseError::MaxRetriesReached.into())
+		Err(DatabaseError::MaxRetriesReached(anyhow::anyhow!(
+			"ladybug graph transaction exhausted {max_retries} retries"
+		))
+		.into())
 	}
 
 	/// Flushes the write-ahead log into the persistent data files.

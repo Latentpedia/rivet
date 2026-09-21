@@ -50,7 +50,7 @@ jobs:
 
   check:
     name: Check
-    runs-on: depot-ubuntu-24.04-8
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -58,6 +58,29 @@ jobs:
           toolchain: stable
           cache-shared-key: rust-ci
           cache-on-failure: true
+
+      # The `lbug` prebuilt archive must postdate LadybugDB/ladybug#1005 (partition
+      # routing hooks in the shipped headers). The latest crates.io release may be
+      # older, so resolve the newest successful main build-and-deploy run, mirroring
+      # LadybugDB/ladybug-rust's CI. The `lbug` build script downloads that run's
+      # archive when `LBUG_PRECOMPILED_RUN_ID` is set.
+      - name: Resolve ladybug prebuilt run
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          API_URL="https://api.github.com/repos/LadybugDB/ladybug/actions/workflows/build-and-deploy.yml/runs"
+          AUTH_HEADER="Authorization: Bearer $GITHUB_TOKEN"
+          ACCEPT_HEADER="Accept: application/vnd.github+json"
+          VERSION_HEADER="X-GitHub-Api-Version: 2022-11-28"
+          RUN_ID="$(curl -fsSL -H "$AUTH_HEADER" -H "$ACCEPT_HEADER" -H "$VERSION_HEADER" \
+            "$API_URL?branch=main&status=success&per_page=1" \
+            | python3 -c 'import json,sys; data=json.load(sys.stdin); runs=data.get("workflow_runs") or []; print(runs[0]["id"] if runs else "")')"
+          if [ -z "$RUN_ID" ]; then
+            echo "Could not find a successful LadybugDB/ladybug build-and-deploy run." >&2
+            exit 1
+          fi
+          echo "Using Ladybug build-and-deploy RUN_ID=$RUN_ID"
+          echo "LBUG_PRECOMPILED_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
 
       - name: Set up repository-specific Rust dependencies
         if: ${{ hashFiles('scripts/ci/pre-rust-check.sh') != '' }}

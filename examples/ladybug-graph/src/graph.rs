@@ -15,6 +15,7 @@
 
 use anyhow::{Result, bail};
 use lbug::Value;
+use serde::{Deserialize, Serialize};
 
 use adbc_core::sync::Driver;
 
@@ -46,7 +47,7 @@ pub fn vertex_table() -> Table {
 
 /// A typed vertex row. `to_props` builds the graph row through the schema-checked builder so a
 /// wrong key or value type is caught before it reaches the store.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Vertex {
 	pub id: i64,
 	pub server: i64,
@@ -115,9 +116,10 @@ pub struct Edge {
 /// parameterized Cypher statement executed through [`adbc_core`].
 ///
 /// `Vertex` is LIST-partitioned by its live computed `cluster` column (one partition subgraph
-/// per community) while `Msg` is HASH-partitioned by target `server` shard, and
-/// [`PartitionRouter`] tracks the wrapper side of that contract: which partition subgraph
-/// serves each cluster or shard, plus the lifecycle of the partitioned tables.
+/// per community) while `Msg` is LIST-partitioned by target `cluster` (one inbox slice per
+/// community, owned by that community's actor), and [`PartitionRouter`] tracks the wrapper side
+/// of that contract: which partition subgraph serves each cluster value, plus the lifecycle of
+/// the partitioned tables.
 pub struct GraphDb {
 	db: LadybugDb,
 	router: PartitionRouter,
@@ -134,13 +136,22 @@ impl GraphDb {
 			.map_err(|e| anyhow::anyhow!("adbc open failed: {e}"))?;
 		Ok(GraphDb {
 			db,
-			router: PartitionRouter::new(NUM_SERVERS),
+			router: PartitionRouter::new(),
 		})
 	}
 
 	/// The partition router modelling the distributed wrapper contract (placement, lifecycle).
 	pub fn router(&mut self) -> &mut PartitionRouter {
 		&mut self.router
+	}
+
+	/// Re-discovers both LIST partition maps (`Vertex`, `Msg`) from the catalog. Called
+	/// automatically on cache misses; call explicitly when a fresh handle must observe
+	/// partitions it never wrote through (tests, diagnostics).
+	pub fn refresh_partitions(&mut self) -> Result<()> {
+		self.router.refresh_list_map(&mut self.db, "Vertex")?;
+		self.router.refresh_list_map(&mut self.db, "Msg")?;
+		Ok(())
 	}
 
 	/// The partition subgraph holding `cluster` (e.g. `Vertex_p2`). Cluster-colocated reads
@@ -152,11 +163,14 @@ impl GraphDb {
 		Ok(table)
 	}
 
-	/// The partition subgraph serving a shard's messages (e.g. `Msg_p1`).
-	pub fn msg_partition(&mut self, server: i64) -> Result<String> {
-		let index = self.router.msg_placement(&mut self.db, server)?;
-		let table = self.router.table_for("Msg", index);
-		assert_eq!(self.router.locate(&table), Location::Local);
+	/// The `Msg` partition subgraph holding `cluster`'s inbox slice, if the engine has created
+	/// it yet. A community that has never been sent a message has no partition; that reads as
+	/// an empty inbox, not an error.
+	pub fn msg_table_for_cluster(&mut self, cluster: i64) -> Result<Option<String>> {
+		let table = self.router.partition_for_opt(&mut self.db, "Msg", cluster)?;
+		if let Some(ref table) = table {
+			assert_eq!(self.router.locate(table), Location::Local);
+		}
 		Ok(table)
 	}
 
@@ -205,8 +219,9 @@ impl GraphDb {
 	///
 	/// `Vertex` is LIST-partitioned by its live computed `cluster` column: each community
 	/// physically lives in its own partition subgraph, created on demand at first sight of a
-	/// new value. `Msg` is HASH-partitioned by target `server` shard (messages route to fixed
-	/// compute shards, not to communities). `Run` stays a plain table: one row per run.
+	/// new value. `Msg` is LIST-partitioned by target `cluster`: each community's inbox slice
+	/// lives in its own partition subgraph, owned exclusively by that community's actor.
+	/// `Run` stays a plain table: one row per run.
 	///
 	/// The rel table must come after the first vertex writes: rel coverage over a
 	/// LIST-partitioned parent is frozen when the rel table is created, so a partition born
@@ -221,13 +236,12 @@ impl GraphDb {
 			 PARTITION BY LIST(cluster)",
 		)?;
 		self.router.note_created("Vertex", "LIST(cluster)");
-		self.update(&format!(
-			"CREATE NODE TABLE IF NOT EXISTS Msg(msg_id SERIAL, to_id INT64, server INT64, \
+		self.update(
+			"CREATE NODE TABLE IF NOT EXISTS Msg(msg_id SERIAL, to_id INT64, cluster INT64, \
 			 kind INT64, payload INT64, round INT64, PRIMARY KEY(msg_id)) \
-			 PARTITION BY HASH(server) PARTITIONS {NUM_SERVERS}",
-		))?;
-		self.router
-			.note_created("Msg", &format!("HASH(server) x{NUM_SERVERS}"));
+			 PARTITION BY LIST(cluster)",
+		)?;
+		self.router.note_created("Msg", "LIST(cluster)");
 		self.update(
 			"CREATE NODE TABLE IF NOT EXISTS Run(run_id INT64, k INT64, rounds INT64, \
 			 done BOOLEAN, PRIMARY KEY(run_id))",
@@ -385,34 +399,39 @@ impl GraphDb {
 			.unwrap_or(0))
 	}
 
-	// -- message passing (the ADBC inter-instance channel) --------------------
+	// -- message passing (partitioned inbox slices) -----------------------------
 
-	/// Writes a message row targeting `to_id` in `round`. `server` is derived from `to_id` so a
-	/// worker can read exactly the messages aimed at its own shard, and the `round` column keeps
-	/// superstep barriers clean: a message is only consumed by the worker for the shard+round it
-	/// targets.
-	pub fn write_msg_round(
+	/// Writes a message row addressed to `to_id`, owned by `cluster` (the target's home
+	/// community at send time). The write goes through the parent so the engine routes it
+	/// into that community's `Msg` partition, creating the partition on first sight of the
+	/// value. The `round` column keeps superstep barriers clean: a message written in round
+	/// `r` is only ever consumed by the owning actor's round-`r+1` pass.
+	pub fn write_cluster_msg(
 		&mut self,
 		to_id: i64,
+		cluster: i64,
 		kind: i64,
 		payload: i64,
 		round: i64,
 	) -> Result<()> {
-		let server = to_id % NUM_SERVERS;
 		self.update(&format!(
-			"CREATE (:Msg {{to_id: {to_id}, server: {server}, kind: {kind}, payload: {payload}, round: {round}}})"
+			"CREATE (:Msg {{to_id: {to_id}, cluster: {cluster}, kind: {kind}, payload: {payload}, round: {round}}})"
 		))
 	}
 
-	/// Reads messages of one round targeting `server`'s shard, returning `(to_id, kind, payload)`.
-	/// Like [`GraphDb::read_vertices`], this reads the shard's `Msg` partition directly.
-	pub fn read_msgs_round(&mut self, server: i64, round: i64) -> Result<Vec<(i64, i64, i64)>> {
-		let table = self.msg_partition(server)?;
+	/// Reads one community's inbox slice for one round, returning `(to_id, kind, payload)`
+	/// straight from its `Msg` partition (pruned, then filtered) — the store-side half of
+	/// routing a message to its owning actor. A community with no `Msg` partition yet reads
+	/// as an empty inbox.
+	pub fn read_cluster_msgs(&mut self, cluster: i64, round: i64) -> Result<Vec<(i64, i64, i64)>> {
+		let Some(table) = self.msg_table_for_cluster(cluster)? else {
+			return Ok(Vec::new());
+		};
 		let rows = self.query_params(
 			&format!(
-				"MATCH (m:{table}) WHERE m.server = $s AND m.round = $r RETURN m.to_id, m.kind, m.payload"
+				"MATCH (m:{table}) WHERE m.cluster = $c AND m.round = $r RETURN m.to_id, m.kind, m.payload"
 			),
-			&[("s", Value::Int64(server)), ("r", Value::Int64(round))],
+			&[("c", Value::Int64(cluster)), ("r", Value::Int64(round))],
 		)?;
 		Ok(rows
 			.into_iter()
@@ -434,12 +453,64 @@ impl GraphDb {
 			.collect())
 	}
 
-	pub fn write_msg(&mut self, to_id: i64, kind: i64, payload: i64) -> Result<()> {
-		self.write_msg_round(to_id, kind, payload, 0)
+	/// Re-addresses one vertex's already-written round messages from its old home to its new
+	/// one (delete + reinsert: the engine refuses in-place partition-key updates). Called by
+	/// the migrating owner immediately after the move, so offers written earlier in the same
+	/// round follow the vertex instead of orphaning in the old partition. Returns how many
+	/// rows moved.
+	pub fn forward_msgs(
+		&mut self,
+		to_id: i64,
+		from_cluster: i64,
+		to_cluster: i64,
+		round: i64,
+	) -> Result<i64> {
+		if from_cluster == to_cluster {
+			return Ok(0);
+		}
+		let Some(table) = self.msg_table_for_cluster(from_cluster)? else {
+			return Ok(0);
+		};
+		let rows = self.query_params(
+			&format!(
+				"MATCH (m:{table}) WHERE m.to_id = $t AND m.round = $r RETURN m.kind, m.payload"
+				),
+			&[("t", Value::Int64(to_id)), ("r", Value::Int64(round))],
+		)?;
+		let mut stragglers = Vec::new();
+		for r in &rows {
+			let kind = match r.get(0).cloned().flatten() {
+				Some(Value::Int64(v)) => v,
+				_ => continue,
+			};
+			let payload = match r.get(1).cloned().flatten() {
+				Some(Value::Int64(v)) => v,
+				_ => continue,
+			};
+			stragglers.push((kind, payload));
+		}
+		if stragglers.is_empty() {
+			return Ok(0);
+		}
+		self.update_params(
+			&format!("MATCH (m:{table}) WHERE m.to_id = $t AND m.round = $r DELETE m"),
+			&[("t", Value::Int64(to_id)), ("r", Value::Int64(round))],
+		)?;
+		for (kind, payload) in &stragglers {
+			self.write_cluster_msg(to_id, to_cluster, *kind, *payload, round)?;
+		}
+		Ok(stragglers.len() as i64)
 	}
 
-	pub fn read_msgs(&mut self, server: i64) -> Result<Vec<(i64, i64, i64)>> {
-		self.read_msgs_round(server, 0)
+	/// Every vertex row in the store, in `id` order, via the parent union. Used to build the
+	/// coordinator's directory snapshot, live-cluster set, and final reports — all bulk reads
+	/// that intentionally span partitions instead of addressing one owner's slice.
+	pub fn read_all_vertices(&mut self) -> Result<Vec<Vertex>> {
+		let rows = self.query(
+			"MATCH (v:Vertex) \
+			 RETURN v.id, v.server, v.cluster, v.value, v.degree, v.core, v.active ORDER BY v.id",
+		)?;
+		rows.iter().map(|r| Vertex::parse(r)).collect()
 	}
 
 	pub fn count_msgs(&mut self) -> Result<i64> {

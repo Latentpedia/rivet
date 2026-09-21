@@ -1,9 +1,9 @@
 //! End-to-end tests for the distributed message-passing graph algorithms.
 //!
-//! Each test stands up a real LadybugDB server on an ephemeral port and drives `NUM_SERVERS`
-//! shard workers against it. The workers talk to the store (and so to each other) only through
-//! the remote ADBC bridge, mirroring how `NUM_SERVERS` separate Rivet servers would exchange
-//! messages over the graph database across machines.
+//! Each test stands up a real LadybugDB server on an ephemeral port and drives one owner per
+//! live community against it. The owners touch only their own cluster slices and talk to each
+//! other only through the store's partitioned tables over the remote ADBC bridge, mirroring how
+//! separate Rivet servers would share one store across machines.
 
 use std::collections::HashSet;
 
@@ -180,7 +180,7 @@ fn list_partitions_map_each_initial_cluster() {
 		db.router().lifecycle(),
 		&[
 			"created Vertex LIST(cluster)".to_string(),
-			"created Msg HASH(server) x3".to_string()
+			"created Msg LIST(cluster)".to_string()
 		]
 	);
 
@@ -315,30 +315,34 @@ fn edges_span_partitions() {
 	assert_eq!(db.neighbors(7).unwrap(), vec![6]);
 }
 
-/// The `Msg` table is partitioned by target shard too: routed writes land in the owning
-/// partition and the shard's next-round read finds them there.
+/// The `Msg` table is partitioned by owning community too: addressed writes land in the home
+/// slice's partition and only that slice's owner reads them there.
 #[test]
-fn msg_writes_route_to_shard_partitions() {
+fn msg_writes_route_to_cluster_slices() {
 	let server = TestServer::new();
 	let mut db = server.open_db();
 	db.create_schema().unwrap();
+	seed_demo_graph(&mut db).unwrap();
 
-	// to_id 4 -> server 1, to_id 5 -> server 2.
-	db.write_msg_round(4, 1, 10, 0).unwrap();
-	db.write_msg_round(5, 1, 20, 0).unwrap();
+	// Vertices 4 and 5 start in distinct singleton communities.
+	db.write_cluster_msg(4, 4, 1, 10, 0).unwrap();
+	db.write_cluster_msg(5, 5, 1, 20, 0).unwrap();
 
-	let msg_p1 = db.msg_partition(1).unwrap();
-	let msg_p2 = db.msg_partition(2).unwrap();
-	assert_ne!(msg_p1, msg_p2, "shards 1 and 2 own different partitions");
-	let in_p1 = db
-		.query(&format!("MATCH (m:{msg_p1}) RETURN m.to_id"))
+	let msg_p4 = db.msg_table_for_cluster(4).unwrap();
+	let msg_p5 = db.msg_table_for_cluster(5).unwrap();
+	assert!(msg_p4.is_some() && msg_p5.is_some());
+	assert_ne!(msg_p4, msg_p5, "communities 4 and 5 own different slices");
+	let in_p4 = db
+		.query(&format!("MATCH (m:{}) RETURN m.to_id", msg_p4.unwrap()))
 		.unwrap();
-	let in_p2 = db
-		.query(&format!("MATCH (m:{msg_p2}) RETURN m.to_id"))
+	let in_p5 = db
+		.query(&format!("MATCH (m:{}) RETURN m.to_id", msg_p5.unwrap()))
 		.unwrap();
-	assert_eq!(in_p1.len() + in_p2.len(), 2);
-	assert_eq!(db.read_msgs_round(1, 0).unwrap(), vec![(4, 1, 10)]);
-	assert_eq!(db.read_msgs_round(2, 0).unwrap(), vec![(5, 1, 20)]);
+	assert_eq!(in_p4.len() + in_p5.len(), 2);
+	assert_eq!(db.read_cluster_msgs(4, 0).unwrap(), vec![(4, 1, 10)]);
+	assert_eq!(db.read_cluster_msgs(5, 0).unwrap(), vec![(5, 1, 20)]);
+	// A community nobody messaged has no partition yet, which reads as empty.
+	assert_eq!(db.read_cluster_msgs(6, 0).unwrap(), Vec::new());
 }
 
 /// The pure-DB algorithm must tolerate an empty graph (converges in one round, no error).

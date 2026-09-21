@@ -1,23 +1,27 @@
-//! Distributed message-passing graph algorithms over the shared ADBC graph store.
+//! Distributed message-passing graph algorithms over the partitioned store.
 //!
-//! Each algorithm runs in **supersteps** (a bulk-synchronous parallel / Pregel-style model). The
-//! vertex set is partitioned across a fixed number of shards ("servers"), and each server owns one
-//! shard. Servers never contact each other directly; their only channel is the shared LadybugDB
-//! graph store, and every read/write through that channel goes over [`adbc_core`] (see
-//! [`crate::graph::GraphDb`]).
+//! Each algorithm runs in **supersteps** (a bulk-synchronous parallel model).
+//! The vertex set is partitioned across live communities ("clusters"), and
+//! each cluster is owned by exactly one actor (see [`crate::clusters`]).
+//! Owners never contact each other directly; their only channel is the shared
+//! LadybugDB graph store, and every read/write through that channel goes over
+//! [`adbc_core`] (see [`crate::graph::GraphDb`]).
 //!
 //! A superstep is a barrier round:
 //!
-//! 1. Each server's worker reads the messages aimed at its shard for the current round (via an
-//!    ADBC read over the `Msg` table) plus the current state of the vertices it owns.
-//! 2. Each vertex applies the messages to its local state and, if its state changed, writes
-//!    messages to its neighbors for the next round (via ADBC writes to the `Msg` table).
-//! 3. The coordinator counts how many messages were produced; when a round produces none, the
-//!    fixed point is reached and the algorithm terminates.
+//! 1. Each cluster's owner reads its community's rows (via a pruned ADBC read
+//!    over its `Vertex` partition) plus its inbox slice for the current round
+//!    (a pruned read over its `Msg` partition).
+//! 2. Each vertex applies the messages to its local state and, if its state
+//!    changed, writes messages to its neighbors for the next round, addressed
+//!    by each neighbor's current home cluster.
+//! 3. The coordinator counts how many messages were produced; when a round
+//!    produces none, the fixed point is reached and the algorithm terminates.
 //!
-//! The `round` column on `Msg` keeps the barriers clean across shards: a message written in round
-//! `r` is only ever consumed by the round-`r+1` pass, so a later server in the same superstep never
-//! observes an earlier server's just-written messages.
+//! The `round` column on `Msg` keeps the barrier clean across owners: a
+//! message written in round `r` is only ever consumed by the round-`r+1`
+//! pass, so a later owner in the same superstep never observes an earlier
+//! owner's just-written messages.
 //!
 //! Two algorithms are implemented:
 //!
@@ -27,13 +31,15 @@
 //!   as `active = true, core = k`.
 //! - [`Algorithm::Wcc`] — weakly connected components. Components are labels; each vertex adopts
 //!   the smallest label it hears (its own to start) and propagates the improvement to its
-//!   neighbors. The label is the live `cluster` partition key, so every improvement physically
-//!   migrates the row with delete + insert ([`GraphDb::move_vertex_to_cluster`]); the final
-//!   per-vertex label is also mirrored in `value`.
+//!   neighbors. The label is the live `cluster` partition key, so every improvement
+//!   physically migrates the row with delete + insert
+//!   ([`GraphDb::move_vertex_to_cluster`]); the final per-vertex label is also mirrored in
+//!   `value`.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
-use crate::graph::{GraphDb, NUM_SERVERS, Vertex};
+use crate::clusters::{EngineStats, directory, live_clusters, run_cluster_superstep};
+use crate::graph::{GraphDb, Vertex};
 
 /// Message kinds written to the shared `Msg` table.
 pub mod kind {
@@ -61,108 +67,13 @@ pub struct RunOutcome {
 
 const MAX_SUPERSTEPS: i64 = 10_000;
 
-/// Runs one superstep for the vertices owned by `shard`. `round` is the current superstep index.
-/// Returns the number of messages this shard wrote for the next round. Public so a Rivet worker
-/// actor can run exactly its own shard of one superstep.
-pub fn run_superstep(db: &mut GraphDb, shard: i64, round: i64, algo: Algorithm) -> Result<i64> {
-	let vertices = db.read_vertices(shard)?;
-	// Only rounds >= 1 have messages aimed at them: superstep 0 processes the initial state.
-	let msgs = if round > 0 {
-		db.read_msgs_round(shard, round - 1)?
-	} else {
-		Vec::new()
-	};
-
-	let mut produced = 0i64;
-	for v in &vertices {
-		if !v.active {
-			continue;
-		}
-		run_vertex(db, v, &msgs, round, algo, &mut produced)?;
-	}
-	Ok(produced)
-}
-
-fn run_vertex(
-	db: &mut GraphDb,
-	v: &Vertex,
-	msgs: &[(i64, i64, i64)],
-	round: i64,
-	algo: Algorithm,
-	produced: &mut i64,
-) -> Result<()> {
-	match algo {
-		Algorithm::KCore { k } => {
-			// Sum the incoming decrements targeting this vertex.
-			let decr: i64 = msgs
-				.iter()
-				.filter(|(to, k2, _)| *to == v.id && *k2 == kind::DECREMENT)
-				.map(|(_, _, p)| *p)
-				.sum();
-			let new_degree = v.degree - decr;
-
-			if new_degree < k {
-				// Leave the k-core and propagate the drop to every remaining neighbor, which
-				// decrements their effective degree in the next superstep.
-				let removed = Vertex {
-					degree: new_degree,
-					core: k,
-					active: false,
-					..v.clone()
-				};
-				db.persist_vertex(&removed)
-					.context("persist k-core removal")?;
-				for n in db.neighbors(v.id)? {
-					db.write_msg_round(n, kind::DECREMENT, 1, round)?;
-					*produced += 1;
-				}
-			} else if new_degree != v.degree {
-				let updated = Vertex {
-					degree: new_degree,
-					..v.clone()
-				};
-				db.persist_vertex(&updated).context("persist degree")?;
-			}
-		}
-		Algorithm::Wcc => {
-			// Smallest component label this vertex hears. The label is the live cluster key.
-			let mut label = v.cluster;
-			for (to, k2, p) in msgs {
-				if *to == v.id && *k2 == kind::COMPONENT && *p < label {
-					label = *p;
-				}
-			}
-			if label < v.cluster {
-				// Join the better community: delete + insert migrates the row into the
-				// label's partition (the engine refuses in-place partition-key updates)
-				// and rewires its incident edges. `value` mirrors the label.
-				let updated = Vertex {
-					value: label,
-					..v.clone()
-				};
-				db.move_vertex_to_cluster(&updated, label)
-					.context("migrate wcc vertex")?;
-				for n in db.neighbors(v.id)? {
-					db.write_msg_round(n, kind::COMPONENT, label, round)?;
-					*produced += 1;
-				}
-			} else if round == 0 {
-				// Seed: in the first superstep each vertex offers its own label to its neighbors
-				// so propagation has a starting point.
-				for n in db.neighbors(v.id)? {
-					db.write_msg_round(n, kind::COMPONENT, v.cluster, round)?;
-					*produced += 1;
-				}
-			}
-		}
-	}
-	Ok(())
-}
-
-/// Drives an algorithm to a fixed point across `NUM_SERVERS` shards and persists the final state.
+/// Drives an algorithm to a fixed point across the live clusters and persists the final state.
 ///
-/// This is the coordinator. It is shard-agnostic; it only advances the superstep barrier and
-/// counts messages, both through ADBC reads/writes on the shared store.
+/// This is the coordinator. It is ownership-agnostic: it only advances the superstep barrier
+/// and counts messages. The per-cluster compute lives in
+/// [`run_cluster_superstep`](crate::clusters::run_cluster_superstep), which the Rivet
+/// [`Coordinator`](crate::actors::Coordinator) invokes once per owner per round; this driver
+/// runs the same protocol inline for tests and the standalone demo.
 pub struct Coordinator {
 	db: GraphDb,
 }
@@ -180,8 +91,13 @@ impl Coordinator {
 		self.db
 	}
 
-	/// Runs `algo` to a fixed point. The graph must already be seeded and `start_run` called.
-	pub fn run(mut self, algo: Algorithm) -> Result<RunOutcome> {
+	/// Runs `algo` to a fixed point with message-locality counters. The graph must already be
+	/// seeded and `start_run` called.
+	pub fn run_with_stats(mut self, algo: Algorithm) -> Result<(RunOutcome, EngineStats)> {
+		let mut stats = EngineStats::default();
+		// The directory snapshot assigns every vertex to its round's owner; reports update
+		// it, so the next round routes invocations (and the next run's reads) correctly.
+		let mut directory = directory(&mut self.db)?;
 		let mut produced = i64::MAX;
 		let mut round = 0i64;
 		let mut rounds = 0i64;
@@ -192,33 +108,43 @@ impl Coordinator {
 				bail!("algorithm did not converge within {MAX_SUPERSTEPS} supersteps");
 			}
 			produced = 0;
-			for shard in 0..NUM_SERVERS {
-				produced += run_superstep(&mut self.db, shard, round, algo)?;
+			for cluster in live_clusters(&directory) {
+				let member_ids: Vec<i64> = directory
+					.iter()
+					.filter(|(_, home)| **home == cluster)
+					.map(|(id, _)| *id)
+					.collect();
+				let step = run_cluster_superstep(&mut self.db, cluster, &member_ids, round, algo)?;
+				produced += step.produced;
+				stats.local_msgs += step.local;
+				stats.remote_msgs += step.remote;
+				for m in step.migrated {
+					directory.insert(m.id, m.to);
+				}
 			}
 			round += 1;
 		}
 
 		// Finalize: surviving k-core vertices carry the core value; report all vertices.
+		// The store already holds every update (it is the live state, not a sink), so this
+		// only stamps the survivors and clears the spent inbox slices.
 		if let Algorithm::KCore { k } = algo {
-			for shard in 0..NUM_SERVERS {
-				for v in self.db.read_vertices(shard)? {
-					if v.active {
-						let survivor = Vertex { core: k, ..v };
-						self.db
-							.persist_vertex(&survivor)
-							.context("set survivor core")?;
-					}
+			for v in self.db.read_all_vertices()? {
+				if v.active {
+					self.db.persist_vertex(&Vertex { core: k, ..v })?;
 				}
 			}
 		}
 
 		self.db.clear_msgs()?;
 
-		let mut vertices = Vec::new();
-		for shard in 0..NUM_SERVERS {
-			vertices.extend(self.db.read_vertices(shard)?);
-		}
+		let mut vertices = self.db.read_all_vertices()?;
 		vertices.sort_by_key(|v| v.id);
-		Ok(RunOutcome { rounds, vertices })
+		Ok((RunOutcome { rounds, vertices }, stats))
+	}
+
+	/// Runs `algo` to a fixed point. The graph must already be seeded and `start_run` called.
+	pub fn run(self, algo: Algorithm) -> Result<RunOutcome> {
+		Ok(self.run_with_stats(algo)?.0)
 	}
 }

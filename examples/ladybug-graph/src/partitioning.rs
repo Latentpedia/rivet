@@ -1,11 +1,13 @@
 //! Client-side partition router mirroring LadybugDB's distributed partition-routing hooks.
 //!
-//! `Vertex` is a `PARTITION BY LIST(cluster)` parent: one partition subgraph per distinct
-//! cluster id, created on demand at first sight of a new value (`Vertex_p0` is the unkeyed
-//! partition made at DDL time and stays empty; `Vertex_p1`, `Vertex_p2`, ... hold the values
-//! in first-sight order). The engine owns the value-to-partition map (it persists on the
-//! parent entry) and the catalog metadata; a distributed wrapper only owns *where* each
-//! partition lives. That wrapper contract is LadybugDB PR #829,
+//! Both `Vertex` and `Msg` are `PARTITION BY LIST(cluster)` parents: one partition subgraph per
+//! distinct cluster id, created on demand at first sight of a new value (`<parent>_p0` is the
+//! unkeyed partition made at DDL time and stays empty; `<parent>_p1`, `<parent>_p2`, ... hold
+//! the values in first-sight order). `Vertex` partitions hold community rows; `Msg` partitions
+//! hold the matching inbox slices, so each community's actor exclusively reads and writes two
+//! colocated slices. The engine owns the value-to-partition map (it persists on each parent
+//! entry) and the catalog metadata; a distributed wrapper only owns *where* each partition
+//! lives. That wrapper contract is LadybugDB PR #829,
 //! `common/partition_routing_hook.h` (`PartitionRoutingHooks`):
 //!
 //! | Hook | What it decides | This module's equivalent |
@@ -44,17 +46,23 @@
 //!
 //! In a multi-host deployment each host would install real hooks claiming its partitions in
 //! `locate()` and serving them in `bindScan()`; here every partition is local, so the router
-//! claims nothing and the engine handles all storage. Moving these decisions into
+//! claims nothing and the engine handles all storage. Rivet adds the compute-routing half:
+//! the coordinator's directory maps each cluster to its owning actor, which is the same
+//! mapping a host's `locate()` claims would carry — LadybugDB routes *rows* to partitions,
+//! Rivet routes *invocations* to the partition's owner. Moving these decisions into
 //! `setPartitionRoutingHooks` later changes no query shape: cluster reads already address one
 //! partition, and writes already carry the key the engine routes on.
 //!
-//! `Msg` is partitioned differently — `PARTITION BY HASH(server)` over the fixed compute
-//! shards — because messages target shards, not clusters. Its placement is still the engine's
-//! `hash(server) % n` function, probed once per shard and cached ([`PartitionRouter::msg_placement`]).
+//! Ownership discipline (enforced by convention, checked by
+//! [`check_store_ownership`](crate::clusters::check_store_ownership)): only the actor owning
+//! cluster `C` writes `Vertex` rows with `cluster = C`, `Msg` rows with `cluster = C`, or
+//! moves rows out of `C`. Every other actor may read across partitions (neighbor lookups,
+//! directory scans) but never write outside its slice.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use crate::adbc::LadybugDb;
 use lbug::Value;
@@ -68,26 +76,23 @@ pub enum Location {
 	Remote,
 }
 
+/// Empty map shared by the table accessors before their first discovery.
+static EMPTY_MAP: LazyLock<HashMap<i64, String>> = LazyLock::new(HashMap::new);
+
 /// Placement + lifecycle decisions for one deployment's partitioned tables.
 #[derive(Debug, Default)]
 pub struct PartitionRouter {
-	/// Fixed partition count of the HASH-partitioned `Msg` table.
-	msg_partitions: i64,
-	/// Engine-computed `hash(server) % n` per shard, for `Msg` writes and reads.
-	msg_placement_cache: HashMap<i64, usize>,
-	/// Discovered `cluster value -> partition table` map for the LIST-partitioned `Vertex`
-	/// table (e.g. `{0: "Vertex_p1", 1: "Vertex_p2"}`).
-	cluster_map: HashMap<i64, String>,
+	/// Discovered `cluster value -> partition table` map per LIST-partitioned parent
+	/// (e.g. `{"Vertex": {0: "Vertex_p1"}, "Msg": {0: "Msg_p1"}}`).
+	list_maps: HashMap<String, HashMap<i64, String>>,
 	/// Lifecycle notifications observed (`created Vertex LIST(cluster)`, ...).
 	lifecycle: Vec<String>,
 }
 
 impl PartitionRouter {
-	pub fn new(msg_partitions: i64) -> Self {
+	pub fn new() -> Self {
 		PartitionRouter {
-			msg_partitions,
-			msg_placement_cache: HashMap::new(),
-			cluster_map: HashMap::new(),
+			list_maps: HashMap::new(),
 			lifecycle: Vec::new(),
 		}
 	}
@@ -115,62 +120,27 @@ impl PartitionRouter {
 		&self.lifecycle
 	}
 
-	/// The subgraph table name for partition `index` of a HASH-partitioned `parent`
-	/// (`Msg_p<i>`). LIST-partitioned tables resolve names through the discovered
-	/// [`PartitionRouter::partition_for_cluster`] map instead, since their indexes carry no
-	/// key meaning.
-	pub fn table_for(&self, parent: &str, index: usize) -> String {
-		format!("{parent}_p{index}")
-	}
-
-	/// Which HASH partition the engine assigns to `Msg` rows with shard key `server`. Probed
-	/// from the engine (`hash($server) % n`) once per distinct shard and cached; the wrapper
-	/// never decides *which* partition a row belongs to, only *where* it lives.
-	pub fn msg_placement(&mut self, db: &mut LadybugDb, server: i64) -> Result<usize> {
-		if let Some(cached) = self.msg_placement_cache.get(&server) {
-			return Ok(*cached);
-		}
-		let rows = db
-			.query(
-				"RETURN hash($k) % $n",
-				&[
-					("k", Value::Int64(server)),
-					("n", Value::Int64(self.msg_partitions)),
-				],
-			)
-			.map_err(|e| anyhow::anyhow!("engine placement probe failed: {e}"))?;
-		let index = match rows.first().and_then(|r| r.first().cloned().flatten()) {
-			Some(Value::Int64(v)) => v,
-			Some(Value::Int128(v)) => i64::try_from(v).unwrap_or(-1),
-			other => bail!("unexpected placement probe result: {other:?}"),
-		};
-		if index < 0 || index >= self.msg_partitions {
-			bail!("engine placed shard {server} in out-of-range partition {index}");
-		}
-		let index = index as usize;
-		self.msg_placement_cache.insert(server, index);
-		Ok(index)
-	}
-
-	/// Re-discovers the engine's cluster-to-partition map from the catalog. Lists the
-	/// `Vertex_p<i>` tables and samples one `cluster` value from each non-empty one; the
-	/// unkeyed DDL-time partition (`Vertex_p0`) stays empty and maps nothing. Discoveries
+	/// Re-discovers one parent's cluster-to-partition map from the catalog. Lists the
+	/// `<parent>_p<i>` tables and samples one `cluster` value from each non-empty one; the
+	/// unkeyed DDL-time partition (`<parent>_p0`) stays empty and maps nothing. Discoveries
 	/// merge into the cached map and are never removed: a partition keeps its key forever,
 	/// so a cluster whose rows all migrated away still resolves to its (now empty) table
 	/// instead of looking unseeded. Called automatically on cache misses and after writes
 	/// that may have created partitions.
-	pub fn refresh_clusters(&mut self, db: &mut LadybugDb) -> Result<()> {
+	pub fn refresh_list_map(&mut self, db: &mut LadybugDb, parent: &str) -> Result<()> {
 		let tables = db
 			.query("CALL show_tables() RETURN *", &[])
 			.map_err(|e| anyhow::anyhow!("list partition tables failed: {e}"))?;
+		let prefix = format!("{parent}_p");
 		let mut partitions: Vec<String> = tables
 			.iter()
 			.filter_map(|row| match row.get(1).cloned().flatten() {
-				Some(Value::String(name)) if name.starts_with("Vertex_p") => Some(name),
+				Some(Value::String(name)) if name.starts_with(&prefix) => Some(name),
 				_ => None,
 			})
 			.collect();
 		partitions.sort();
+		let map = self.list_maps.entry(parent.to_string()).or_default();
 		for table in &partitions {
 			let rows = db
 				.query(&format!("MATCH (v:{table}) RETURN v.cluster LIMIT 1"), &[])
@@ -178,33 +148,91 @@ impl PartitionRouter {
 			if let Some(Value::Int64(cluster)) =
 				rows.first().and_then(|r| r.first().cloned().flatten())
 			{
-				self.cluster_map.insert(cluster, table.clone());
+				map.insert(cluster, table.clone());
 			}
 		}
 		Ok(())
 	}
 
-	/// The partition subgraph holding `cluster` (the `bindScan` equivalent: a cluster-colocated
-	/// read scans this table directly instead of the parent union). Reads the cached map and
-	/// re-discovers it on a miss, so partitions created on demand by a concurrent writer are
-	/// picked up. Fails for values the engine has never seen: writing the first row with a new
-	/// cluster creates its partition, but rel coverage is frozen at rel-table creation, so the
-	/// cluster domain must be pre-seeded (see [`crate::graph::seed_edges`]).
-	pub fn partition_for_cluster(&mut self, db: &mut LadybugDb, cluster: i64) -> Result<String> {
-		if let Some(table) = self.cluster_map.get(&cluster).cloned() {
+	/// The partition subgraph holding `cluster` under `parent` (the `bindScan` equivalent:
+	/// a cluster-colocated read scans this table directly instead of the parent union).
+	/// Reads the cached map and re-discovers it on a miss, so partitions created on demand
+	/// by a concurrent writer are picked up. Fails for values the engine has never seen:
+	/// writing the first row with a new cluster creates its partition, but rel coverage is
+	/// frozen at rel-table creation, so the cluster domain must be pre-seeded (see
+	/// [`crate::graph::seed_edges`]).
+	pub fn partition_for(
+		&mut self,
+		db: &mut LadybugDb,
+		parent: &str,
+		cluster: i64,
+	) -> Result<String> {
+		if let Some(table) = self
+			.list_maps
+			.get(parent)
+			.and_then(|map| map.get(&cluster))
+			.cloned()
+		{
 			return Ok(table);
 		}
-		self.refresh_clusters(db)?;
-		self.cluster_map.get(&cluster).cloned().ok_or_else(|| {
-			anyhow::anyhow!(
-				"cluster {cluster} has no partition yet: seed a row with that cluster before \
-				 creating edges against it (rel coverage is frozen at rel-table creation)"
-			)
-		})
+		self.refresh_list_map(db, parent)?;
+		self.list_maps
+			.get(parent)
+			.and_then(|map| map.get(&cluster))
+			.cloned()
+			.ok_or_else(|| {
+				anyhow::anyhow!(
+					"cluster {cluster} has no {parent} partition yet: seed a row with that cluster before \
+					 creating edges against it (rel coverage is frozen at rel-table creation)"
+				)
+			})
 	}
 
-	/// The discovered cluster-to-partition map, for tests and diagnostics.
+	/// Like [`partition_for`](PartitionRouter::partition_for), but a value the engine has
+	/// never seen resolves to `None` instead of failing. For `Msg` inbox reads that means an
+	/// empty inbox: a community that has never been sent a message simply has no partition.
+	pub fn partition_for_opt(
+		&mut self,
+		db: &mut LadybugDb,
+		parent: &str,
+		cluster: i64,
+	) -> Result<Option<String>> {
+		if let Some(table) = self
+			.list_maps
+			.get(parent)
+			.and_then(|map| map.get(&cluster))
+			.cloned()
+		{
+			return Ok(Some(table));
+		}
+		self.refresh_list_map(db, parent)?;
+		Ok(self
+			.list_maps
+			.get(parent)
+			.and_then(|map| map.get(&cluster))
+			.cloned())
+	}
+
+	/// The `Vertex` partition subgraph holding `cluster` (e.g. `Vertex_p2`).
+	pub fn partition_for_cluster(&mut self, db: &mut LadybugDb, cluster: i64) -> Result<String> {
+		self.partition_for(db, "Vertex", cluster)
+	}
+
+	/// Re-discovers the engine's `Vertex` cluster-to-partition map (see
+	/// [`refresh_list_map`](PartitionRouter::refresh_list_map)). Kept under its historic
+	/// name for the edge-rewiring path in
+	/// [`move_vertex_to_cluster`](crate::graph::GraphDb::move_vertex_to_cluster).
+	pub fn refresh_clusters(&mut self, db: &mut LadybugDb) -> Result<()> {
+		self.refresh_list_map(db, "Vertex")
+	}
+
+	/// The discovered `Vertex` cluster-to-partition map, for tests and diagnostics.
 	pub fn cluster_map(&self) -> &HashMap<i64, String> {
-		&self.cluster_map
+		self.list_maps.get("Vertex").unwrap_or(&EMPTY_MAP)
+	}
+
+	/// The discovered `Msg` cluster-to-partition map, for tests and diagnostics.
+	pub fn msg_cluster_map(&self) -> &HashMap<i64, String> {
+		self.list_maps.get("Msg").unwrap_or(&EMPTY_MAP)
 	}
 }
